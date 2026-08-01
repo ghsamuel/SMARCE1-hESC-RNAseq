@@ -13,3 +13,6 @@ results/
 *.html
 data/quant_trimmed/
 data/5wk_del/
+
+/.quarto/
+**/*.quarto_ipynb

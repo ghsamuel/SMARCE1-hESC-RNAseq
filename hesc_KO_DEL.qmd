@@ -238,51 +238,101 @@ make_volcano(res_KO_vs_DEL_lfc, res_KO_vs_DEL_raw, "KO vs DEL (direct)")
 
 ## Phenocopy Classification
 
-For every gene tested in both KO-vs-WT and DEL-vs-WT, compare the two effect
-sizes directly: does DEL recreate KO's effect (full or partial phenocopy),
-is the effect KO- or DEL-specific, or do the two move in opposite directions?
+For every gene tested in both KO-vs-WT and DEL-vs-WT, the two effect sizes are
+compared directly. This separates genes with similar KO and DEL responses from
+partial phenocopies, DEL-enhanced responses, perturbation-specific genes, and
+genes moving in opposite directions.
+
+The magnitude categories are descriptive rather than validated biological
+boundaries. Among genes significant in both contrasts and changing in the same
+direction, a DEL:KO absolute effect-size ratio of 0.75--1.25 is called
+**Similar effect**, below 0.75 is **Partial phenocopy**, and above 1.25 is
+**DEL-enhanced**.
 
 ```{r phenocopy}
 #| echo: false
-#| fig-width: 8
+#| fig-width: 9
 #| fig-height: 7
 pheno <- inner_join(
-  res_KO_df  %>% dplyr::select(gene_id, gene_symbol, lfc_KO = log2FoldChange, padj_KO = padj),
-  res_DEL_df %>% dplyr::select(gene_id, lfc_DEL = log2FoldChange, padj_DEL = padj),
+  res_KO_df %>%
+    dplyr::select(gene_id, gene_symbol, lfc_KO = log2FoldChange, padj_KO = padj),
+  res_DEL_df %>%
+    dplyr::select(gene_id, lfc_DEL = log2FoldChange, padj_DEL = padj),
   by = "gene_id"
 ) %>%
-  filter(!is.na(lfc_KO), !is.na(lfc_DEL)) %>%
+  filter(is.finite(lfc_KO), is.finite(lfc_DEL)) %>%
   mutate(
-    sig_KO  = !is.na(padj_KO)  & padj_KO  < alpha & abs(lfc_KO)  > lfc_cutoff,
+    sig_KO = !is.na(padj_KO) & padj_KO < alpha & abs(lfc_KO) > lfc_cutoff,
     sig_DEL = !is.na(padj_DEL) & padj_DEL < alpha & abs(lfc_DEL) > lfc_cutoff,
+    same_direction = sign(lfc_KO) == sign(lfc_DEL),
+    effect_ratio = if_else(abs(lfc_KO) > 0, abs(lfc_DEL) / abs(lfc_KO), NA_real_),
     category = case_when(
-      sig_KO & sig_DEL & sign(lfc_KO) == sign(lfc_DEL) & abs(lfc_DEL) >= 0.5 * abs(lfc_KO) ~ "Full phenocopy",
-      sig_KO & sig_DEL & sign(lfc_KO) == sign(lfc_DEL)                                       ~ "Partial phenocopy",
-      sig_KO & sig_DEL & sign(lfc_KO) != sign(lfc_DEL)                                       ~ "Opposite",
-      sig_KO  & !sig_DEL ~ "KO-only",
-      !sig_KO & sig_DEL  ~ "DEL-specific",
+      sig_KO & sig_DEL & !same_direction ~ "Opposite",
+      sig_KO & sig_DEL & same_direction & effect_ratio < 0.75 ~ "Partial phenocopy",
+      sig_KO & sig_DEL & same_direction & effect_ratio <= 1.25 ~ "Similar effect",
+      sig_KO & sig_DEL & same_direction & effect_ratio > 1.25 ~ "DEL-enhanced",
+      sig_KO & !sig_DEL ~ "KO-specific",
+      !sig_KO & sig_DEL ~ "DEL-specific",
       TRUE ~ "Neither"
     )
   )
 
-pheno %>% filter(category != "Neither") %>% dplyr::count(category) %>% dplyr::arrange(desc(n)) %>%
-  knitr::kable(caption = "Phenocopy category counts")
+pheno_counts <- pheno %>%
+  filter(category != "Neither") %>%
+  dplyr::count(category, name = "n") %>%
+  arrange(desc(n))
+
+knitr::kable(pheno_counts, caption = "Refined phenocopy category counts")
 
 ggplot(pheno %>% filter(category != "Neither"),
        aes(lfc_KO, lfc_DEL, color = category)) +
   geom_point(alpha = 0.6, size = 1.2) +
   geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
-  geom_hline(yintercept = 0, color = "grey80") + geom_vline(xintercept = 0, color = "grey80") +
-  scale_color_manual(values = c("Full phenocopy" = "#1b7837", "Partial phenocopy" = "#7fbf7b",
-                                 "Opposite" = "#c51b7d", "KO-only" = "#A23B72", "DEL-specific" = "#F18F01")) +
+  geom_hline(yintercept = 0, color = "grey80") +
+  geom_vline(xintercept = 0, color = "grey80") +
+  scale_color_manual(values = c(
+    "Similar effect" = "#1b7837",
+    "Partial phenocopy" = "#7fbf7b",
+    "DEL-enhanced" = "#2166ac",
+    "Opposite" = "#c51b7d",
+    "KO-specific" = "#A23B72",
+    "DEL-specific" = "#F18F01"
+  )) +
   theme_bw() +
-  labs(x = "KO log2FC (vs WT)", y = "DEL log2FC (vs WT)", color = NULL,
-       title = "Does DEL phenocopy KO?")
+  labs(
+    x = "KO log2FC (vs WT)",
+    y = "DEL log2FC (vs WT)",
+    color = NULL,
+    title = "How closely does DEL phenocopy KO?"
+  )
 ```
 
-Note: `lfc_DEL >= 0.5 * lfc_KO` is a simple, adjustable threshold for calling
-"full" vs "partial" phenocopy -- reasonable as a starting cutoff, not a
-validated biological boundary.
+### Representative Phenocopy Genes
+
+The table below highlights up to five genes per non-null category. Genes are
+ranked within category by the larger absolute effect across KO and DEL, so the
+table is illustrative rather than a separate statistical test.
+
+```{r phenocopy-representative-genes}
+#| echo: false
+representative_pheno <- pheno %>%
+  filter(category != "Neither") %>%
+  mutate(
+    gene = coalesce(gene_symbol, gene_id),
+    rank_effect = pmax(abs(lfc_KO), abs(lfc_DEL), na.rm = TRUE)
+  ) %>%
+  group_by(category) %>%
+  arrange(desc(rank_effect), .by_group = TRUE) %>%
+  slice_head(n = 5) %>%
+  ungroup() %>%
+  dplyr::select(category, gene, lfc_KO, padj_KO, lfc_DEL, padj_DEL)
+
+knitr::kable(
+  representative_pheno,
+  digits = 3,
+  caption = "Representative genes from each phenocopy category"
+)
+```
 
 ## Gene Overlap
 
@@ -693,21 +743,20 @@ pheatmap(mat_z,
          main = "Top 25 genes by padj, KO + DEL (columns fixed by genotype)")
 ```
 
-# Does 5-Week DEL Become More KO-Like?
+# Does the 3'UTR-Deletion Response Change During Neuronal Differentiation?
 
-hESC-KO showed a large, robust neural/developmental-differentiation
-signature (441 GO terms significant in both ORA and GSEA). hESC-DEL showed
-essentially none. 5-week DEL (same SL25/SL45 clones, differentiated) shows a
-much larger DE gene count than hESC-DEL. Question: does 5-week DEL start
-converging on the same neural/developmental pathways that define hESC-KO's
-phenotype, i.e. does losing the long 3'UTR matter more once differentiation
-is underway and starts to resemble losing the whole protein?
+The hESC analysis shows that complete SMARCE1 loss produces a broad
+transcriptional phenotype, whereas the 3'UTR deletion has a much smaller
+immediate effect. The 5-week neuron data allow a separate developmental
+question: do reproducible DEL responses emerge after differentiation, and do
+those responses resemble hESC KO, persist from hESC DEL, or represent
+neuron-stage-specific effects?
 
-**Caveat:** hESC and 5-week data come from separately run experiments with
-separate WT controls -- comparable for gene identity / pathway overlap, but
-NOT for raw effect-size or DE-count magnitude (different library preps,
-depth, and power). Everything below compares gene/pathway *identity*, not
-magnitude, for exactly that reason.
+**Caveat:** hESC and 5-week data were generated in separate experiments with
+separate WT controls. Therefore, the analysis compares gene identity,
+direction, and within-experiment log2 fold changes. It does not treat the four
+contrasts as one statistical model or directly compare raw expression values
+between experiments.
 
 ```{r load-5wk-data}
 sl25_5wk <- read.csv(here::here("data", "5wk_del", "SL25_vs_H9_full_results.csv")) %>%
@@ -719,42 +768,87 @@ go_sl45_5wk   <- read.csv(here::here("data", "5wk_del", "SL45_vs_H9_GO_enrichmen
 gsea_sl25_5wk <- read.csv(here::here("data", "5wk_del", "SL25_vs_H9_GSEA.csv"))
 gsea_sl45_5wk <- read.csv(here::here("data", "5wk_del", "SL45_vs_H9_GSEA.csv"))
 
-sig_5wk <- function(df) unique(df$ensembl_base[!is.na(df$padj) & df$padj < alpha & abs(df$log2FoldChange) > lfc_cutoff])
+sig_5wk <- function(df) {
+  unique(df$ensembl_base[
+    !is.na(df$padj) & df$padj < alpha & abs(df$log2FoldChange) > lfc_cutoff
+  ])
+}
+
 sig_SL25_5wk <- sig_5wk(sl25_5wk)
 sig_SL45_5wk <- sig_5wk(sl45_5wk)
-sig_DEL_5wk  <- union(sig_SL25_5wk, sig_SL45_5wk)
+sig_DEL_5wk_union <- union(sig_SL25_5wk, sig_SL45_5wk)
+sig_DEL_5wk_both <- intersect(sig_SL25_5wk, sig_SL45_5wk)
 
-cat("5wk SL25 sig genes:", length(sig_SL25_5wk), "\n")
-cat("5wk SL45 sig genes:", length(sig_SL45_5wk), "\n")
-cat("5wk DEL (union) sig genes:", length(sig_DEL_5wk), "\n")
+cat("5wk SL25 significant genes:", length(sig_SL25_5wk), "\n")
+cat("5wk SL45 significant genes:", length(sig_SL45_5wk), "\n")
+cat("5wk DEL union:", length(sig_DEL_5wk_union), "\n")
+cat("5wk DEL significant in both clones:", length(sig_DEL_5wk_both), "\n")
 ```
 
-## Gene-Level Overlap: hESC-KO vs 5wk-DEL
+## Gene-Level Overlap Across Stages
+
+Ensembl version suffixes are removed before overlap calculations so that hESC
+and 5-week identifiers are compared consistently. Both the permissive 5-week
+union and the more reproducible two-clone intersection are reported.
 
 ```{r gene-overlap-stage}
 #| echo: false
-sig_genes <- function(df, padj_cut = alpha, lfc_cut = lfc_cutoff) {
-  unique(df$gene_id[!is.na(df$padj) & df$padj < padj_cut & abs(df$log2FoldChange) > lfc_cut])
+sig_genes_base <- function(df, padj_cut = alpha, lfc_cut = lfc_cutoff) {
+  df %>%
+    filter(!is.na(padj), padj < padj_cut, abs(log2FoldChange) > lfc_cut) %>%
+    transmute(ensembl_base = sub("\\..*$", "", gene_id)) %>%
+    pull(ensembl_base) %>%
+    unique()
 }
-sig_KO_hesc  <- sig_genes(res_KO_df)                       # from earlier in this report
-sig_DEL_hesc <- sig_genes(res_DEL_df)
 
-bg_stage <- length(intersect(res_KO_df$gene_id, sl25_5wk$ensembl_base))
+sig_KO_hesc <- sig_genes_base(res_KO_df)
+sig_DEL_hesc <- sig_genes_base(res_DEL_df)
 
-overlap_frac <- function(set_a, set_b, tag) {
-  shared <- intersect(set_a, set_b)
-  p <- phyper(length(shared) - 1, length(set_a), bg_stage - length(set_a), length(set_b), lower.tail = FALSE)
-  cat(sprintf("%s: setA=%d, setB=%d, shared=%d (%.1f%% of setB), p=%.3g\n",
-              tag, length(set_a), length(set_b), length(shared),
-              100 * length(shared) / length(set_b), p))
+shared_universe <- Reduce(intersect, list(
+  sub("\\..*$", "", res_KO_df$gene_id),
+  sl25_5wk$ensembl_base,
+  sl45_5wk$ensembl_base
+))
+
+stage_overlap <- function(reference, comparison, label) {
+  reference <- intersect(reference, shared_universe)
+  comparison <- intersect(comparison, shared_universe)
+  shared <- intersect(reference, comparison)
+  p <- phyper(
+    length(shared) - 1,
+    length(reference),
+    length(shared_universe) - length(reference),
+    length(comparison),
+    lower.tail = FALSE
+  )
+  tibble(
+    comparison = label,
+    reference_n = length(reference),
+    comparison_n = length(comparison),
+    shared_n = length(shared),
+    comparison_shared_pct = 100 * length(shared) / max(length(comparison), 1),
+    p_value = p
+  )
 }
-overlap_frac(sig_KO_hesc, sig_DEL_hesc, "hESC-KO vs hESC-DEL")
-overlap_frac(sig_KO_hesc, sig_DEL_5wk,  "hESC-KO vs 5wk-DEL ")
+
+overlap_stage_table <- bind_rows(
+  stage_overlap(sig_KO_hesc, sig_DEL_hesc, "hESC KO vs hESC DEL"),
+  stage_overlap(sig_KO_hesc, sig_DEL_5wk_union, "hESC KO vs 5wk DEL union"),
+  stage_overlap(sig_KO_hesc, sig_DEL_5wk_both, "hESC KO vs 5wk DEL both clones"),
+  stage_overlap(sig_DEL_hesc, sig_DEL_5wk_both, "hESC DEL vs 5wk DEL both clones")
+)
+
+knitr::kable(
+  overlap_stage_table,
+  digits = 3,
+  caption = "Gene-level overlap across hESC and 5-week comparisons"
+)
 ```
 
-If 5wk-DEL's overlap fraction with hESC-KO is higher than hESC-DEL's own
-overlap fraction, that's gene-level evidence DEL "becomes more KO-like" with
-differentiation.
+The two-clone intersection is the stronger evidence because it requires the
+5-week response to replicate in both independently edited DEL clones. Overlap
+alone does not establish that the direction of change is the same; direction is
+addressed in the trajectory analysis below.
 
 ## Pathway-Level Check: Do hESC-KO's Neural Terms Show Up in 5wk-DEL?
 
@@ -778,42 +872,212 @@ bind_rows(sl25_hits %>% mutate(clone = "SL25"), sl45_hits %>% mutate(clone = "SL
   knitr::kable(digits = 4, caption = "hESC-KO neural GO terms recovered in 5wk-DEL GSEA")
 ```
 
-## Heatmap: hESC-KO Neural Genes, Shown in 5wk-DEL Samples
+## Cross-Stage Gene Trajectories
+
+A single cross-stage table is built for genes measured in all four contrasts:
+hESC KO vs WT, hESC DEL vs WT, 5-week SL25 vs H9, and 5-week SL45 vs H9. The
+trajectory categories distinguish early, persistent, delayed, opposite, and
+clone-specific responses.
+
+```{r cross-stage-trajectories}
+#| echo: false
+#| fig-width: 9
+#| fig-height: 6
+hesc_ko_stage <- res_KO_df %>%
+  mutate(ensembl_base = sub("\\..*$", "", gene_id)) %>%
+  transmute(
+    ensembl_base,
+    symbol_KO = gene_symbol,
+    lfc_hESC_KO = log2FoldChange,
+    padj_hESC_KO = padj
+  ) %>%
+  distinct(ensembl_base, .keep_all = TRUE)
+
+hesc_del_stage <- res_DEL_df %>%
+  mutate(ensembl_base = sub("\\..*$", "", gene_id)) %>%
+  transmute(
+    ensembl_base,
+    symbol_DEL = gene_symbol,
+    lfc_hESC_DEL = log2FoldChange,
+    padj_hESC_DEL = padj
+  ) %>%
+  distinct(ensembl_base, .keep_all = TRUE)
+
+wk5_sl25_stage <- sl25_5wk %>%
+  transmute(
+    ensembl_base,
+    symbol_SL25 = gene_symbol,
+    lfc_5wk_SL25 = log2FoldChange,
+    padj_5wk_SL25 = padj
+  ) %>%
+  distinct(ensembl_base, .keep_all = TRUE)
+
+wk5_sl45_stage <- sl45_5wk %>%
+  transmute(
+    ensembl_base,
+    symbol_SL45 = gene_symbol,
+    lfc_5wk_SL45 = log2FoldChange,
+    padj_5wk_SL45 = padj
+  ) %>%
+  distinct(ensembl_base, .keep_all = TRUE)
+
+stage_all <- hesc_ko_stage %>%
+  inner_join(hesc_del_stage, by = "ensembl_base") %>%
+  inner_join(wk5_sl25_stage, by = "ensembl_base") %>%
+  inner_join(wk5_sl45_stage, by = "ensembl_base") %>%
+  mutate(
+    gene_symbol = coalesce(symbol_KO, symbol_DEL, symbol_SL25, symbol_SL45),
+    sig_hESC_KO = !is.na(padj_hESC_KO) & padj_hESC_KO < alpha &
+      abs(lfc_hESC_KO) > lfc_cutoff,
+    sig_hESC_DEL = !is.na(padj_hESC_DEL) & padj_hESC_DEL < alpha &
+      abs(lfc_hESC_DEL) > lfc_cutoff,
+    sig_5wk_SL25 = !is.na(padj_5wk_SL25) & padj_5wk_SL25 < alpha &
+      abs(lfc_5wk_SL25) > lfc_cutoff,
+    sig_5wk_SL45 = !is.na(padj_5wk_SL45) & padj_5wk_SL45 < alpha &
+      abs(lfc_5wk_SL45) > lfc_cutoff,
+    same_5wk_direction = sign(lfc_5wk_SL25) == sign(lfc_5wk_SL45),
+    mean_5wk_lfc = rowMeans(cbind(lfc_5wk_SL25, lfc_5wk_SL45), na.rm = TRUE),
+    reproducible_5wk = sig_5wk_SL25 & sig_5wk_SL45 & same_5wk_direction,
+    any_5wk = sig_5wk_SL25 | sig_5wk_SL45,
+    same_as_KO = sign(mean_5wk_lfc) == sign(lfc_hESC_KO),
+    same_as_DEL = sign(mean_5wk_lfc) == sign(lfc_hESC_DEL),
+    trajectory = case_when(
+      reproducible_5wk & sig_hESC_KO & sig_hESC_DEL & same_as_KO & same_as_DEL ~
+        "Shared persistent",
+      reproducible_5wk & sig_hESC_DEL & same_as_DEL ~ "Persistent DEL",
+      reproducible_5wk & !sig_hESC_DEL & sig_hESC_KO & same_as_KO ~
+        "Delayed KO-like",
+      reproducible_5wk & !sig_hESC_KO & !sig_hESC_DEL ~
+        "Differentiation-specific DEL",
+      reproducible_5wk & ((sig_hESC_KO & !same_as_KO) |
+        (sig_hESC_DEL & !same_as_DEL)) ~ "Opposite",
+      any_5wk & !reproducible_5wk ~ "Clone-specific 5wk",
+      sig_hESC_KO & !any_5wk ~ "hESC KO-only",
+      sig_hESC_DEL & !any_5wk ~ "hESC DEL-only",
+      TRUE ~ "No classified response"
+    )
+  )
+
+trajectory_counts <- stage_all %>%
+  filter(trajectory != "No classified response") %>%
+  dplyr::count(trajectory, name = "n") %>%
+  arrange(desc(n))
+
+knitr::kable(trajectory_counts, caption = "Cross-stage trajectory category counts")
+
+ggplot(trajectory_counts, aes(x = reorder(trajectory, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = NULL,
+    y = "Number of genes",
+    title = "Cross-stage SMARCE1 response trajectories"
+  )
+```
+
+### Cross-Stage Effect-Size Heatmap
+
+The heatmap shows up to 50 genes from the biologically informative,
+reproducible 5-week categories. Values are log2 fold changes within each
+experiment, capped at -4 to 4 for display. Because the experiments have
+separate controls, the heatmap is interpreted as a direction-and-effect summary,
+not as a shared expression matrix.
 
 ```{r heatmap-stage-comparison}
 #| echo: false
-#| fig-width: 9
-#| fig-height: 10
-ko_neural_genes <- res_KO_df %>%
-  filter(!is.na(padj), padj < alpha) %>%
-  mutate(ensembl_base = sub("\\..*$", "", gene_id)) %>%
-  arrange(padj) %>% slice_head(n = 30) %>% pull(ensembl_base)
-
-wk5_mat <- sl25_5wk %>% filter(ensembl_base %in% ko_neural_genes) %>%
-  dplyr::select(gene_id, gene_symbol, starts_with("5wkNeu")) %>%
-  column_to_rownames("gene_id")
-gene_syms_lookup <- setNames(wk5_mat$gene_symbol, rownames(wk5_mat))
-wk5_mat <- as.matrix(wk5_mat %>% dplyr::select(-gene_symbol))
-wk5_mat_log <- log2(wk5_mat + 1)
-
-# Drop genes with any missing values, then drop genes with zero variance
-wk5_mat_log <- wk5_mat_log[complete.cases(wk5_mat_log), ]
-wk5_mat_log <- wk5_mat_log[apply(wk5_mat_log, 1, sd) > 0, ]
-
-wk5_mat_z <- t(scale(t(wk5_mat_log)))
-rownames(wk5_mat_z) <- gene_syms_lookup[rownames(wk5_mat_z)]
-
-wk5_condition <- case_when(
-  grepl("H9", colnames(wk5_mat_z))  ~ "WT",
-  grepl("SL25", colnames(wk5_mat_z)) ~ "SL25",
-  grepl("SL45", colnames(wk5_mat_z)) ~ "SL45"
+#| fig-width: 10
+#| fig-height: 12
+plot_categories <- c(
+  "Shared persistent",
+  "Persistent DEL",
+  "Delayed KO-like",
+  "Differentiation-specific DEL",
+  "Opposite"
 )
-anno_wk5 <- data.frame(Condition = wk5_condition, row.names = colnames(wk5_mat_z))
 
-pheatmap(wk5_mat_z, annotation_col = anno_wk5, show_rownames = TRUE, fontsize_row = 7,
-         cluster_cols = FALSE, cluster_rows = TRUE,
-         color = colorRampPalette(c("blue3", "white", "red3"))(100),
-         main = "hESC-KO top neural genes, expression in 5wk WT/SL25/SL45")
+cross_stage <- stage_all %>%
+  filter(trajectory %in% plot_categories) %>%
+  mutate(rank_effect = abs(mean_5wk_lfc)) %>%
+  arrange(desc(rank_effect)) %>%
+  slice_head(n = 50)
+
+cat("Cross-stage genes plotted:", nrow(cross_stage), "\n")
+
+if (nrow(cross_stage) == 0) {
+  cat("No genes met the reproducible cross-stage trajectory criteria.\n")
+} else {
+  cross_stage_mat <- cross_stage %>%
+    dplyr::select(lfc_hESC_KO, lfc_hESC_DEL, lfc_5wk_SL25, lfc_5wk_SL45) %>%
+    as.matrix()
+
+  finite_rows <- apply(cross_stage_mat, 1, function(x) all(is.finite(x)))
+  cross_stage_mat <- cross_stage_mat[finite_rows, , drop = FALSE]
+  cross_stage_plot <- cross_stage[finite_rows, , drop = FALSE]
+  cross_stage_mat <- pmax(pmin(cross_stage_mat, 4), -4)
+
+  gene_labels <- ifelse(
+    is.na(cross_stage_plot$gene_symbol) | cross_stage_plot$gene_symbol == "",
+    cross_stage_plot$ensembl_base,
+    cross_stage_plot$gene_symbol
+  )
+  rownames(cross_stage_mat) <- make.unique(gene_labels)
+  colnames(cross_stage_mat) <- c("hESC KO", "hESC DEL", "5wk SL25", "5wk SL45")
+
+  anno_stage <- data.frame(
+    Trajectory = cross_stage_plot$trajectory,
+    row.names = rownames(cross_stage_mat)
+  )
+
+  if (nrow(cross_stage_mat) == 0) {
+    cat("No finite genes remained for the cross-stage heatmap.\n")
+  } else {
+    pheatmap(
+      cross_stage_mat,
+      annotation_row = anno_stage,
+      show_rownames = TRUE,
+      fontsize_row = 7,
+      cluster_cols = FALSE,
+      cluster_rows = nrow(cross_stage_mat) >= 2,
+      color = colorRampPalette(c("blue3", "white", "red3"))(100),
+      breaks = seq(-4, 4, length.out = 101),
+      main = "Cross-stage log2 fold-change trajectories"
+    )
+  }
+}
+```
+
+### Representative Cross-Stage Genes
+
+Up to five genes per major trajectory are shown below. Ranking is based on the
+mean absolute 5-week effect, emphasizing reproducible neuronal-stage responses.
+
+```{r cross-stage-representative-genes}
+#| echo: false
+representative_stage <- stage_all %>%
+  filter(trajectory %in% plot_categories) %>%
+  mutate(
+    gene = coalesce(gene_symbol, ensembl_base),
+    rank_effect = abs(mean_5wk_lfc)
+  ) %>%
+  group_by(trajectory) %>%
+  arrange(desc(rank_effect), .by_group = TRUE) %>%
+  slice_head(n = 5) %>%
+  ungroup() %>%
+  dplyr::select(
+    trajectory,
+    gene,
+    lfc_hESC_KO,
+    lfc_hESC_DEL,
+    lfc_5wk_SL25,
+    lfc_5wk_SL45
+  )
+
+knitr::kable(
+  representative_stage,
+  digits = 3,
+  caption = "Representative genes from major cross-stage trajectories"
+)
 ```
 
 # Discussion
