@@ -1,0 +1,15 @@
+.Rproj.user/
+.quarto/
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+
+objects/
+results/
+
+*_cache/
+*_files/
+*.html
+data/quant_trimmed/
+data/5wk_del/
