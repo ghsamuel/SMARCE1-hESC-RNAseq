@@ -1,0 +1,2256 @@
+# ============================================================================
+# hesc_KO_DEL_v9_integrated.R  --  END TO END
+#
+# Everything in one file, in the order it actually runs:
+#   PART 1  DESeq2            (scripts/01_run_analysis.R)
+#   PART 2  GO / GSEA / rrvgo (scripts/02_run_enrichment.R)
+#   PART 3  Report body       (hesc_KO_DEL_v9_integrated.qmd, all 57 chunks)
+#
+# Code is unchanged from those three sources. The .qmd and the scripts/ files
+# are untouched and remain the source of record for rendering.
+#
+# PART 1 is ~15 min and PART 2 is ~20 min. Both still saveRDS() to objects/ at
+# the end, exactly as before, so set either flag to FALSE to load the cached
+# result instead of recomputing. PART 3 always runs off whatever is in memory.
+# ============================================================================
+
+RECOMPUTE_DESEQ      <- TRUE   # FALSE = readRDS objects/analysis_results.rds
+RECOMPUTE_ENRICHMENT <- TRUE   # FALSE = readRDS objects/enrichment_results.rds
+
+suppressPackageStartupMessages({
+  library(tidyverse); library(DESeq2); library(ggrepel); library(apeglm)
+  library(pheatmap); library(org.Hs.eg.db); library(AnnotationDbi)
+  library(clusterProfiler); library(EnhancedVolcano); library(enrichplot)
+  library(GOSemSim); library(rrvgo); library(tximport); library(here)
+  library(VennDiagram); library(patchwork)
+})
+
+# ============================================================================
+# PART 1 -- DESeq2
+# verbatim from scripts/01_run_analysis.R
+# ============================================================================
+
+if (RECOMPUTE_DESEQ) {
+
+
+  dir.create(here::here("objects"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(here::here("results", "tables"), recursive = TRUE, showWarnings = FALSE)
+
+  # Import counts
+  samples <- read.csv(here::here("data", "metadata.csv"), header = TRUE, stringsAsFactors = FALSE)
+
+  files <- file.path(here::here("data", "quant_trimmed"), samples$sample_id, "quant.sf")
+  names(files) <- samples$sample_id
+
+  tx2gene <- read.delim(here::here("data", "tx2gene.tsv"), header = FALSE, stringsAsFactors = FALSE)
+  colnames(tx2gene) <- c("TXNAME", "GENEID", "GENENAME")
+
+  txi <- tximport(files, type = "salmon",
+                  tx2gene = tx2gene[, c("TXNAME", "GENEID")],
+                  countsFromAbundance = "no")
+
+  sym <- setNames(tx2gene$GENENAME, tx2gene$GENEID)
+
+  # Check sample order before analysis
+  stopifnot(all(samples$sample_id %in% names(files)))
+  stopifnot(identical(samples$sample_id, names(files)))
+
+  # Filter and run clone-level DESeq2
+  samples$family <- case_when(
+    samples$genotype == "WT" ~ "WT",
+    samples$genotype %in% c("null1", "null2") ~ "KO",
+    samples$genotype %in% c("del1", "del2")   ~ "DEL"
+  )
+
+  # Set factors explicitly so DESeq2 does not convert character columns silently
+  samples$genotype <- relevel(factor(samples$genotype), ref = "WT")
+  samples$family <- factor(samples$family, levels = c("WT", "KO", "DEL"))
+
+  # Confirm imported count columns and metadata are in the same order
+  stopifnot(identical(samples$sample_id, colnames(txi$counts)))
+
+  ddsTxi <- DESeqDataSetFromTximport(txi, colData = samples, design = ~ genotype)
+
+  sumcounts <- rowSums(counts(ddsTxi))
+
+  keep <- sumcounts > 50
+  ddsTxi <- ddsTxi[keep, ]
+  cat("Genes retained after filtering:", nrow(ddsTxi), "\n")
+
+  vsd <- vst(ddsTxi, blind = FALSE)
+  pca_data <- plotPCA(vsd, returnData = TRUE, intgroup = "genotype", ntop = 500)
+  percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+
+  dds <- DESeq(ddsTxi)
+  resultsNames(dds)
+
+  alpha <- 0.01
+  lfc_cutoff <- 1
+
+  res_KO56 <- results(dds, contrast = c("genotype", "null1", "WT"), alpha = alpha)
+  res_KO67 <- results(dds, contrast = c("genotype", "null2", "WT"), alpha = alpha)
+  res_SL25 <- results(dds, contrast = c("genotype", "del1", "WT"), alpha = alpha)
+  res_SL45 <- results(dds, contrast = c("genotype", "del2", "WT"), alpha = alpha)
+
+  res_KO56_df <- as.data.frame(res_KO56) %>% rownames_to_column("gene_id") %>%
+    mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+  res_KO67_df <- as.data.frame(res_KO67) %>% rownames_to_column("gene_id") %>%
+    mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+  res_SL25_df <- as.data.frame(res_SL25) %>% rownames_to_column("gene_id") %>%
+    mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+  res_SL45_df <- as.data.frame(res_SL45) %>% rownames_to_column("gene_id") %>%
+    mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+
+  res_KO56_LFC <- lfcShrink(dds, coef = "genotype_null1_vs_WT", type = "apeglm")
+  res_KO67_LFC <- lfcShrink(dds, coef = "genotype_null2_vs_WT", type = "apeglm")
+  res_SL25_LFC <- lfcShrink(dds, coef = "genotype_del1_vs_WT", type = "apeglm")
+  res_SL45_LFC <- lfcShrink(dds, coef = "genotype_del2_vs_WT", type = "apeglm")
+
+  de_summary <- data.frame(
+    Comparison = c("KO56 vs WT", "KO67 vs WT", "SL25 vs WT", "SL45 vs WT"),
+    Total_DE = c(sum(res_KO56$padj < alpha, na.rm = TRUE),
+                 sum(res_KO67$padj < alpha, na.rm = TRUE),
+                 sum(res_SL25$padj < alpha, na.rm = TRUE),
+                 sum(res_SL45$padj < alpha, na.rm = TRUE))
+  )
+
+
+  # Family-level model
+  dds_family <- DESeqDataSetFromTximport(txi, colData = samples, design = ~ family)
+  dds_family <- dds_family[rowSums(counts(dds_family)) > 50, ]
+  dds_family <- DESeq(dds_family)
+
+  res_KO  <- results(dds_family, contrast = c("family", "KO",  "WT"), alpha = alpha)
+  res_DEL <- results(dds_family, contrast = c("family", "DEL", "WT"), alpha = alpha)
+
+  res_KO_df  <- as.data.frame(res_KO)  %>% rownames_to_column("gene_id") %>%
+    mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+  res_DEL_df <- as.data.frame(res_DEL) %>% rownames_to_column("gene_id") %>%
+    mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+
+  cat("KO family DE genes (padj<0.01):", sum(res_KO_df$padj < alpha, na.rm = TRUE), "\n")
+  cat("DEL family DE genes (padj<0.01):", sum(res_DEL_df$padj < alpha, na.rm = TRUE), "\n")
+
+  # Direct KO versus DEL model
+  ko_del_samples <- samples$sample_id[samples$family %in% c("KO", "DEL")]
+  cd_kd <- samples[samples$sample_id %in% ko_del_samples, ]
+  rownames(cd_kd) <- cd_kd$sample_id
+  cd_kd$family <- factor(cd_kd$family, levels = c("DEL", "KO"))   # DEL = reference
+
+  txi_kd <- tximport(files[ko_del_samples], type = "salmon",
+                      tx2gene = tx2gene[, c("TXNAME", "GENEID")], countsFromAbundance = "no")
+  dds_kd <- DESeqDataSetFromTximport(txi_kd, colData = cd_kd, design = ~ family)
+  dds_kd <- dds_kd[rowSums(counts(dds_kd)) > 50, ]
+  dds_kd <- DESeq(dds_kd)
+
+  res_KO_vs_DEL_lfc <- lfcShrink(dds_kd, coef = "family_KO_vs_DEL", type = "apeglm")
+  res_KO_vs_DEL_raw <- results(dds_kd, name = "family_KO_vs_DEL")
+  res_KO_vs_DEL_df <- as.data.frame(res_KO_vs_DEL_lfc) %>% rownames_to_column("gene_id") %>%
+    mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+
+  cat("KO vs DEL: ", sum(res_KO_vs_DEL_df$padj < alpha, na.rm = TRUE), "genes differ directly (padj<", alpha, ")\n")
+
+
+  # Save the main analysis objects
+  analysis_results <- list(
+    samples = samples, files = files, tx2gene = tx2gene, sym = sym, txi = txi,
+    ddsTxi = ddsTxi, dds = dds, dds_family = dds_family, dds_kd = dds_kd,
+    vsd = vsd, pca_data = pca_data, percentVar = percentVar, sumcounts = sumcounts,
+    alpha = alpha, lfc_cutoff = lfc_cutoff, de_summary = de_summary,
+    res_KO56 = res_KO56, res_KO67 = res_KO67, res_SL25 = res_SL25, res_SL45 = res_SL45,
+    res_KO56_df = res_KO56_df, res_KO67_df = res_KO67_df,
+    res_SL25_df = res_SL25_df, res_SL45_df = res_SL45_df,
+    res_KO56_LFC = res_KO56_LFC, res_KO67_LFC = res_KO67_LFC,
+    res_SL25_LFC = res_SL25_LFC, res_SL45_LFC = res_SL45_LFC,
+    res_KO = res_KO, res_DEL = res_DEL, res_KO_df = res_KO_df, res_DEL_df = res_DEL_df,
+    res_KO_vs_DEL_lfc = res_KO_vs_DEL_lfc, res_KO_vs_DEL_raw = res_KO_vs_DEL_raw,
+    res_KO_vs_DEL_df = res_KO_vs_DEL_df,
+    settings = list(alpha = alpha, lfc_cutoff = lfc_cutoff,
+                    filtering = "rowSums(counts) > 50",
+                    clone_design = "~ genotype", family_design = "~ family",
+                    generated = Sys.time())
+  )
+  saveRDS(analysis_results, here::here("objects", "analysis_results.rds"))
+  writeLines(capture.output(sessionInfo()), here::here("results", "sessionInfo_analysis.txt"))
+  cat("Saved objects/analysis_results.rds\n")
+
+
+} else {
+  list2env(readRDS(here::here("objects", "analysis_results.rds")), envir = environment())
+}
+
+
+# ============================================================================
+# PART 2 -- GO / GSEA / semantic clustering
+# verbatim from scripts/02_run_enrichment.R
+# ============================================================================
+
+if (RECOMPUTE_ENRICHMENT) {
+
+
+
+  directional_go <- function(de_df, tag, lfc_cut = 1, padj_cut = 0.01) {
+    de_df$ensembl_base <- sub("\\..*$", "", de_df$gene_id)
+    universe <- unique(de_df$ensembl_base[!is.na(de_df$padj)])
+    up   <- unique(de_df$ensembl_base[!is.na(de_df$padj) & de_df$padj < padj_cut & de_df$log2FoldChange >  lfc_cut])
+    down <- unique(de_df$ensembl_base[!is.na(de_df$padj) & de_df$padj < padj_cut & de_df$log2FoldChange < -lfc_cut])
+    cat(tag, ":", length(up), "UP,", length(down), "DOWN (padj<", padj_cut, ", |LFC|>", lfc_cut, ")\n")
+
+    ego_up   <- enrichGO(up,   universe = universe, OrgDb = org.Hs.eg.db, keyType = "ENSEMBL",
+                          ont = "ALL", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+    ego_down <- enrichGO(down, universe = universe, OrgDb = org.Hs.eg.db, keyType = "ENSEMBL",
+                          ont = "ALL", pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+    list(up = ego_up, down = ego_down)
+  }
+
+  run_gsea <- function(de_df, ranking_column) {
+    de_df$ensembl_base <- sub("\\..*$", "", de_df$gene_id)
+    df <- de_df %>% filter(!is.na(.data[[ranking_column]]), !is.na(ensembl_base)) %>%
+      distinct(ensembl_base, .keep_all = TRUE)
+    ranks <- setNames(df[[ranking_column]], df$ensembl_base)
+    ranks <- sort(ranks, decreasing = TRUE)
+    gseGO(ranks, OrgDb = org.Hs.eg.db, keyType = "ENSEMBL", ont = "BP",
+          pvalueCutoff = 0.05, minGSSize = 15, maxGSSize = 500, eps = 0, seed = TRUE)
+  }
+
+  # Run enrichment once
+  go_KO <- directional_go(res_KO_df, "KO")
+  go_DEL <- directional_go(res_DEL_df, "DEL")
+  gsea_KO <- run_gsea(res_KO_df, "stat")
+  gsea_DEL <- run_gsea(res_DEL_df, "stat")
+
+  merge_go_gsea <- function(ora_up, ora_down, gsea_obj, tag) {
+    ora_all <- bind_rows(
+      as.data.frame(ora_up)   %>% mutate(direction = "UP"),
+      as.data.frame(ora_down) %>% mutate(direction = "DOWN")
+    ) %>% dplyr::select(ID, Description, direction, ora_padj = p.adjust)
+
+    gsea_df <- as.data.frame(gsea_obj) %>%
+      dplyr::select(ID, Description, NES, gsea_padj = p.adjust) %>%
+      mutate(direction = ifelse(NES > 0, "UP", "DOWN"))
+
+    merged <- full_join(ora_all, gsea_df, by = c("ID", "Description", "direction")) %>%
+      mutate(in_both = !is.na(ora_padj) & !is.na(gsea_padj),
+             condition = tag) %>%
+      arrange(desc(in_both), ora_padj, gsea_padj)
+    merged
+  }
+  merged_KO  <- merge_go_gsea(go_KO$up,  go_KO$down,  gsea_KO,  "KO")
+  merged_DEL <- merge_go_gsea(go_DEL$up, go_DEL$down, gsea_DEL, "DEL")
+  merged_all <- bind_rows(merged_KO, merged_DEL)
+
+  cat("KO: ", sum(merged_KO$in_both, na.rm = TRUE), "terms significant in both ORA and GSEA\n")
+  cat("DEL:", sum(merged_DEL$in_both, na.rm = TRUE), "terms significant in both ORA and GSEA\n")
+
+  # Semantic reduction
+  hsGO <- godata('org.Hs.eg.db', ont = "BP")
+
+  gsea_KO_simplified <- clusterProfiler::simplify(gsea_KO, cutoff = 0.7, by = "p.adjust",
+                                                   select_fun = min, semData = hsGO)
+
+
+
+
+  go_ids <- gsea_KO@result$ID
+  simMatrix <- calculateSimMatrix(go_ids, orgdb = "org.Hs.eg.db", ont = "BP", method = "Rel")
+
+  scores <- setNames(-log10(gsea_KO@result$p.adjust), gsea_KO@result$ID)
+  reducedTerms <- reduceSimMatrix(simMatrix, scores, threshold = 0.7, orgdb = "org.Hs.eg.db")
+
+  cat("Original terms:", nrow(simMatrix), "| Reduced to", length(unique(reducedTerms$parentTerm)), "parent clusters\n")
+
+
+
+  gsea_KO_pt <- pairwise_termsim(gsea_KO)
+
+  # Relabel gene-member columns (ORA geneID, GSEA core_enrichment) from the
+  # ENSEMBL keys used for testing to gene symbols, for readable output tables.
+  to_readable <- function(x) setReadable(x, OrgDb = org.Hs.eg.db, keyType = "ENSEMBL")
+  gsea_KO            <- to_readable(gsea_KO)
+  gsea_DEL           <- to_readable(gsea_DEL)
+  go_KO$up           <- to_readable(go_KO$up)
+  go_KO$down         <- to_readable(go_KO$down)
+  go_DEL$up          <- to_readable(go_DEL$up)
+  go_DEL$down        <- to_readable(go_DEL$down)
+  gsea_KO_simplified <- to_readable(gsea_KO_simplified)
+  gsea_KO_pt         <- to_readable(gsea_KO_pt)
+
+
+  enrichment_results <- list(
+    go_KO = go_KO, go_DEL = go_DEL, gsea_KO = gsea_KO, gsea_DEL = gsea_DEL,
+    merged_KO = merged_KO, merged_DEL = merged_DEL, merged_all = merged_all,
+    hsGO = hsGO, gsea_KO_simplified = gsea_KO_simplified,
+    reducedTerms = reducedTerms, gsea_KO_pt = gsea_KO_pt,
+    settings = list(go_ontology = "ALL for ORA; BP for GSEA",
+                    gsea_rank = "Wald statistic", generated = Sys.time())
+  )
+  saveRDS(enrichment_results, here::here("objects", "enrichment_results.rds"))
+  writeLines(capture.output(sessionInfo()), here::here("results", "sessionInfo_enrichment.txt"))
+  cat("Saved objects/enrichment_results.rds\n")
+
+
+} else {
+  list2env(readRDS(here::here("objects", "enrichment_results.rds")), envir = environment())
+}
+
+
+# ============================================================================
+# PART 3 -- Report body
+# all 57 chunks from hesc_KO_DEL_v9_integrated.qmd, in order
+# ============================================================================
+
+# ---- packages --------------------------------------------------------------
+#| include: false
+suppressPackageStartupMessages({
+  library(tidyverse); library(DESeq2); library(ggrepel); library(apeglm)
+  library(pheatmap); library(org.Hs.eg.db); library(AnnotationDbi)
+  library(clusterProfiler); library(EnhancedVolcano); library(enrichplot)
+  library(GOSemSim); library(rrvgo); library(tximport); library(here)
+  library(VennDiagram); library(patchwork)
+})
+
+source(here::here("R", "plotting_functions.R"))
+
+# ---- setup-directories -----------------------------------------------------
+#| include: false
+qmd_name <- "hesc_KO_DEL_v9_integrated"   # was: tools::file_path_sans_ext(basename(knitr::current_input()))
+output_base <- here::here("results", qmd_name)
+dir.create(file.path(output_base, "tables"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(output_base, "deg_lists"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(output_base, "figures"), recursive = TRUE, showWarnings = FALSE)
+
+#' ## Import Count Data
+
+# ---- counts ----------------------------------------------------------------
+#| echo: false
+cat("Loaded precomputed Salmon import and gene mapping from objects/analysis_results.rds\n")
+
+#' ## Sample Metadata
+
+# ---- sample-table ----------------------------------------------------------
+knitr::kable(samples, caption = "Sample metadata: WT / KO56 / KO67 / SL25 / SL45")
+
+#' ## Quality Control and Filtering
+
+# ---- filtering -------------------------------------------------------------
+#| echo: false
+hist(log10(sumcounts), breaks = 100, main = "Distribution of log10 gene counts",
+     xlab = "log10(sum counts)")
+cat("Genes retained after filtering:", nrow(ddsTxi), "\n")
+
+#' ## Principal Component Analysis
+
+# ---- pca -------------------------------------------------------------------
+#| echo: false
+#| fig-width: 8
+#| fig-height: 6
+ggplot(pca_data, aes(PC1, PC2, color = genotype, label = name)) +
+  geom_point(size = 4, alpha = 0.8) +
+  geom_text_repel(size = 3, max.overlaps = 20) +
+  scale_color_manual(values = c(WT = "#2E86AB", null1 = "#A23B72", null2 = "#C0392B",
+                                 del1 = "#F18F01", del2 = "#E07B39")) +
+  theme_bw() +
+  labs(x = paste0("PC1: ", percentVar[1], "% variance"),
+       y = paste0("PC2: ", percentVar[2], "% variance"),
+       title = "PCA - Top 500 Most Variable Genes", color = "Genotype") +
+  coord_fixed()
+
+#' ## DESeq2 Analysis
+
+# ---- deseq -----------------------------------------------------------------
+#| echo: false
+cat("Loaded precomputed DESeq2 model. Coefficients:\n")
+resultsNames(dds)
+
+#' # Clone-Level Comparisons vs WT
+
+# ---- extract-results -------------------------------------------------------
+#| echo: false
+knitr::kable(de_summary, caption = "DE gene counts per clone (padj < 0.01)")
+
+write.csv(de_summary, file.path(output_base, "tables", "DE_summary_per_clone.csv"), row.names = FALSE)
+write.csv(res_KO56_df, file.path(output_base, "deg_lists", "KO56_vs_WT_full_results.csv"), row.names = FALSE)
+write.csv(res_KO67_df, file.path(output_base, "deg_lists", "KO67_vs_WT_full_results.csv"), row.names = FALSE)
+write.csv(res_SL25_df, file.path(output_base, "deg_lists", "SL25_vs_WT_full_results.csv"), row.names = FALSE)
+write.csv(res_SL45_df, file.path(output_base, "deg_lists", "SL45_vs_WT_full_results.csv"), row.names = FALSE)
+
+#' ## Volcano Plots
+
+# ---- volcano-function ------------------------------------------------------
+#| include: false
+# Plotting function loaded from R/plotting_functions.R
+
+# ---- volcano-plots ---------------------------------------------------------
+#| echo: false
+#| fig-width: 10
+#| fig-height: 8
+png(file.path(output_base, "figures", "volcano_KO56_vs_WT.png"), width = 10, height = 8, units = "in", res = 150)
+make_volcano(res_KO56_LFC, res_KO56, "KO56 vs WT")
+dev.off()
+make_volcano(res_KO56_LFC, res_KO56, "KO56 vs WT")
+
+png(file.path(output_base, "figures", "volcano_KO67_vs_WT.png"), width = 10, height = 8, units = "in", res = 150)
+make_volcano(res_KO67_LFC, res_KO67, "KO67 vs WT")
+dev.off()
+make_volcano(res_KO67_LFC, res_KO67, "KO67 vs WT")
+
+png(file.path(output_base, "figures", "volcano_SL25_vs_WT.png"), width = 10, height = 8, units = "in", res = 150)
+make_volcano(res_SL25_LFC, res_SL25, "SL25 vs WT")
+dev.off()
+make_volcano(res_SL25_LFC, res_SL25, "SL25 vs WT")
+
+png(file.path(output_base, "figures", "volcano_SL45_vs_WT.png"), width = 10, height = 8, units = "in", res = 150)
+make_volcano(res_SL45_LFC, res_SL45, "SL45 vs WT")
+dev.off()
+make_volcano(res_SL45_LFC, res_SL45, "SL45 vs WT")
+
+#' ## MA Plots
+
+# ---- ma-function -----------------------------------------------------------
+#| include: false
+# Plotting function loaded from R/plotting_functions.R
+
+# ---- ma-plots --------------------------------------------------------------
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5.5
+png(file.path(output_base, "figures", "MA_KO56_vs_WT.png"), width = 7, height = 5.5, units = "in", res = 150)
+make_ma(res_KO56_LFC, "KO56 vs WT")
+dev.off()
+make_ma(res_KO56_LFC, "KO56 vs WT")
+
+png(file.path(output_base, "figures", "MA_KO67_vs_WT.png"), width = 7, height = 5.5, units = "in", res = 150)
+make_ma(res_KO67_LFC, "KO67 vs WT")
+dev.off()
+make_ma(res_KO67_LFC, "KO67 vs WT")
+
+png(file.path(output_base, "figures", "MA_SL25_vs_WT.png"), width = 7, height = 5.5, units = "in", res = 150)
+make_ma(res_SL25_LFC, "SL25 vs WT")
+dev.off()
+make_ma(res_SL25_LFC, "SL25 vs WT")
+
+png(file.path(output_base, "figures", "MA_SL45_vs_WT.png"), width = 7, height = 5.5, units = "in", res = 150)
+make_ma(res_SL45_LFC, "SL45 vs WT")
+dev.off()
+make_ma(res_SL45_LFC, "SL45 vs WT")
+
+#' # Clone Concordance
+
+#' ## KO56 vs KO67
+
+# ---- concordance-KO --------------------------------------------------------
+#| echo: false
+#| fig-width: 8
+#| fig-height: 8
+corr_KO <- data.frame(
+  gene_id = rownames(res_KO56),
+  a_wald = res_KO56$stat, b_wald = res_KO67$stat,
+  a_padj = res_KO56$padj, b_padj = res_KO67$padj
+) %>% filter(!is.na(a_wald) & !is.na(b_wald))
+
+r_KO <- cor(corr_KO$a_wald, corr_KO$b_wald, use = "complete.obs")
+de_either_KO <- (!is.na(corr_KO$a_padj) & corr_KO$a_padj < 0.05) |
+                (!is.na(corr_KO$b_padj) & corr_KO$b_padj < 0.05)
+r_KO_de <- cor(corr_KO$a_wald[de_either_KO], corr_KO$b_wald[de_either_KO], use = "complete.obs")
+
+cat("KO56 vs KO67: r (all genes) =", round(r_KO, 3),
+    "| r (DE in either, n=", sum(de_either_KO), ") =", round(r_KO_de, 3), "\n")
+
+p_conc_KO <- ggplot(corr_KO, aes(a_wald, b_wald)) +
+  geom_point(alpha = 0.2, size = 0.6) +
+  geom_point(data = corr_KO[de_either_KO, ], color = "firebrick", alpha = 0.5, size = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+  theme_bw() +
+  labs(x = "KO56 Wald stat", y = "KO67 Wald stat",
+       title = paste0("KO clone concordance (r = ", round(r_KO, 3), ")"))
+p_conc_KO
+ggsave(file.path(output_base, "figures", "concordance_KO56_vs_KO67.png"), p_conc_KO, width = 8, height = 8)
+
+#' ## SL25 vs SL45
+
+# ---- concordance-DEL -------------------------------------------------------
+#| echo: false
+#| fig-width: 8
+#| fig-height: 8
+corr_DEL <- data.frame(
+  gene_id = rownames(res_SL25),
+  a_wald = res_SL25$stat, b_wald = res_SL45$stat,
+  a_padj = res_SL25$padj, b_padj = res_SL45$padj
+) %>% filter(!is.na(a_wald) & !is.na(b_wald))
+
+r_DEL <- cor(corr_DEL$a_wald, corr_DEL$b_wald, use = "complete.obs")
+de_either_DEL <- (!is.na(corr_DEL$a_padj) & corr_DEL$a_padj < 0.05) |
+                 (!is.na(corr_DEL$b_padj) & corr_DEL$b_padj < 0.05)
+r_DEL_de <- cor(corr_DEL$a_wald[de_either_DEL], corr_DEL$b_wald[de_either_DEL], use = "complete.obs")
+
+cat("SL25 vs SL45: r (all genes) =", round(r_DEL, 3),
+    "| r (DE in either, n=", sum(de_either_DEL), ") =", round(r_DEL_de, 3), "\n")
+
+p_conc_DEL <- ggplot(corr_DEL, aes(a_wald, b_wald)) +
+  geom_point(alpha = 0.2, size = 0.6) +
+  geom_point(data = corr_DEL[de_either_DEL, ], color = "firebrick", alpha = 0.5, size = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+  theme_bw() +
+  labs(x = "SL25 Wald stat", y = "SL45 Wald stat",
+       title = paste0("DEL clone concordance (r = ", round(r_DEL, 3), ")"))
+p_conc_DEL
+ggsave(file.path(output_base, "figures", "concordance_SL25_vs_SL45.png"), p_conc_DEL, width = 8, height = 8)
+
+#' Note: KO clones typically show much higher concordance than DEL clones, consistent with SMARCE1 loss producing a larger, more uniform transcriptional effect than 3'UTR deletion alone.
+
+#' # Family-Level Analysis (Pooled Clones vs WT)
+
+#' Refit DESeq2 with a proper `~ family` design (WT / KO / DEL as one factor) so
+#' the pooled contrasts use real pooled dispersion estimates, not an average of
+#' two separate coefficients.
+
+# ---- family-deseq ----------------------------------------------------------
+#| echo: false
+cat("KO family DE genes (padj<0.01):", sum(res_KO_df$padj < alpha, na.rm = TRUE), "\n")
+cat("DEL family DE genes (padj<0.01):", sum(res_DEL_df$padj < alpha, na.rm = TRUE), "\n")
+
+write.csv(res_KO_df, file.path(output_base, "deg_lists", "KO_family_vs_WT_full_results.csv"), row.names = FALSE)
+write.csv(res_DEL_df, file.path(output_base, "deg_lists", "DEL_family_vs_WT_full_results.csv"), row.names = FALSE)
+
+#' ## Direct KO vs DEL Contrast
+
+#' The central mechanistic question isn't just "KO vs WT" and "DEL vs WT" compared
+#' indirectly -- it's KO vs DEL directly: which changes depend on losing the whole
+#' protein, versus just the long 3'UTR?
+
+# ---- ko-vs-del-direct ------------------------------------------------------
+#| echo: false
+#| fig-width: 8
+#| fig-height: 7
+cat("KO vs DEL:", sum(res_KO_vs_DEL_df$padj < alpha, na.rm = TRUE),
+    "genes differ directly (padj<", alpha, ")\n")
+
+png(file.path(output_base, "figures", "volcano_KO_vs_DEL_direct.png"), width = 8, height = 7, units = "in", res = 150)
+make_volcano(res_KO_vs_DEL_lfc, res_KO_vs_DEL_raw, "KO vs DEL (direct)")
+dev.off()
+make_volcano(res_KO_vs_DEL_lfc, res_KO_vs_DEL_raw, "KO vs DEL (direct)")
+
+write.csv(res_KO_vs_DEL_df, file.path(output_base, "deg_lists", "KO_vs_DEL_direct_full_results.csv"), row.names = FALSE)
+
+#' ## Phenocopy Classification
+
+#' For every gene tested in both KO-vs-WT and DEL-vs-WT, the two effect sizes are
+#' compared directly. This separates genes with similar KO and DEL responses from
+#' partial phenocopies, DEL-enhanced responses, perturbation-specific genes, and
+#' genes moving in opposite directions.
+
+#' The magnitude categories are descriptive rather than validated biological
+#' boundaries. Among genes significant in both contrasts and changing in the same
+#' direction, a DEL:KO absolute effect-size ratio of 0.75--1.25 is called
+#' **Similar effect**, below 0.75 is **Partial phenocopy**, and above 1.25 is
+#' **DEL-enhanced**.
+
+# ---- phenocopy -------------------------------------------------------------
+#| echo: false
+#| fig-width: 9
+#| fig-height: 7
+pheno <- inner_join(
+  res_KO_df %>%
+    dplyr::select(gene_id, gene_symbol, lfc_KO = log2FoldChange, padj_KO = padj),
+  res_DEL_df %>%
+    dplyr::select(gene_id, lfc_DEL = log2FoldChange, padj_DEL = padj),
+  by = "gene_id"
+) %>%
+  filter(is.finite(lfc_KO), is.finite(lfc_DEL)) %>%
+  mutate(
+    sig_KO = !is.na(padj_KO) & padj_KO < alpha & abs(lfc_KO) > lfc_cutoff,
+    sig_DEL = !is.na(padj_DEL) & padj_DEL < alpha & abs(lfc_DEL) > lfc_cutoff,
+    same_direction = sign(lfc_KO) == sign(lfc_DEL),
+    effect_ratio = if_else(abs(lfc_KO) > 0, abs(lfc_DEL) / abs(lfc_KO), NA_real_),
+    category = case_when(
+      sig_KO & sig_DEL & !same_direction ~ "Opposite",
+      sig_KO & sig_DEL & same_direction & effect_ratio < 0.75 ~ "Partial phenocopy",
+      sig_KO & sig_DEL & same_direction & effect_ratio <= 1.25 ~ "Similar effect",
+      sig_KO & sig_DEL & same_direction & effect_ratio > 1.25 ~ "DEL-enhanced",
+      sig_KO & !sig_DEL ~ "KO-specific",
+      !sig_KO & sig_DEL ~ "DEL-specific",
+      TRUE ~ "Neither"
+    )
+  )
+
+pheno_counts <- pheno %>%
+  filter(category != "Neither") %>%
+  dplyr::count(category, name = "n") %>%
+  arrange(desc(n))
+
+knitr::kable(pheno_counts, caption = "Refined phenocopy category counts")
+
+p_pheno <- ggplot(pheno %>% filter(category != "Neither"),
+       aes(lfc_KO, lfc_DEL, color = category)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+  geom_hline(yintercept = 0, color = "grey80") +
+  geom_vline(xintercept = 0, color = "grey80") +
+  scale_color_manual(values = c(
+    "Similar effect" = "#1b7837",
+    "Partial phenocopy" = "#7fbf7b",
+    "DEL-enhanced" = "#2166ac",
+    "Opposite" = "#c51b7d",
+    "KO-specific" = "#A23B72",
+    "DEL-specific" = "#F18F01"
+  )) +
+  theme_bw() +
+  labs(
+    x = "KO log2FC (vs WT)",
+    y = "DEL log2FC (vs WT)",
+    color = NULL,
+    title = "How closely does DEL phenocopy KO?"
+  )
+p_pheno
+ggsave(file.path(output_base, "figures", "phenocopy_KO_vs_DEL.png"), p_pheno, width = 9, height = 7)
+
+write.csv(pheno_counts, file.path(output_base, "tables", "phenocopy_category_counts.csv"), row.names = FALSE)
+write.csv(pheno, file.path(output_base, "deg_lists", "phenocopy_full_table.csv"), row.names = FALSE)
+
+#' ### Representative Phenocopy Genes
+
+#' The table below highlights up to five genes per non-null category. Genes are
+#' ranked within category by the larger absolute effect across KO and DEL, so the
+#' table is illustrative rather than a separate statistical test.
+
+# ---- phenocopy-representative-genes ----------------------------------------
+#| echo: false
+representative_pheno <- pheno %>%
+  filter(category != "Neither") %>%
+  mutate(
+    gene = coalesce(gene_symbol, gene_id),
+    rank_effect = pmax(abs(lfc_KO), abs(lfc_DEL), na.rm = TRUE)
+  ) %>%
+  group_by(category) %>%
+  arrange(desc(rank_effect), .by_group = TRUE) %>%
+  slice_head(n = 5) %>%
+  ungroup() %>%
+  dplyr::select(category, gene, lfc_KO, padj_KO, lfc_DEL, padj_DEL)
+
+knitr::kable(
+  representative_pheno,
+  digits = 3,
+  caption = "Representative genes from each phenocopy category"
+)
+
+write.csv(representative_pheno, file.path(output_base, "tables", "phenocopy_representative_genes.csv"), row.names = FALSE)
+
+#' ## Gene Overlap
+
+#' Two levels: between the two clones within each family (reproducibility), and
+#' between the two conditions (KO vs DEL) at the family level.
+
+#' ### Between Clones
+
+# ---- venn-clones -----------------------------------------------------------
+#| echo: false
+#| fig-width: 10
+#| fig-height: 5
+sig_ids <- function(res_obj, padj_cut = 0.05, lfc_cut = lfc_cutoff) {
+  d <- as.data.frame(res_obj) %>% rownames_to_column("gene_id")
+  d$gene_id[!is.na(d$padj) & d$padj < padj_cut & abs(d$log2FoldChange) > lfc_cut]
+}
+sig_KO56 <- sig_ids(res_KO56); sig_KO67 <- sig_ids(res_KO67)
+sig_SL25 <- sig_ids(res_SL25); sig_SL45 <- sig_ids(res_SL45)
+
+draw_venn2 <- function(a, b, labs, cols, main) {
+  grid::grid.draw(VennDiagram::venn.diagram(
+    list(a, b), category.names = labs, filename = NULL, disable.logging = TRUE,
+    fill = cols, alpha = 0.55, cex = 1.1, cat.cex = 1.0, main = main,
+    main.cex = 1.2
+  ))
+}
+
+grid::grid.newpage()
+grid::pushViewport(grid::viewport(layout = grid::grid.layout(1, 2)))
+grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 1))
+draw_venn2(sig_KO56, sig_KO67, c("KO56", "KO67"), c("#2ca25f", "#2ca25f"), "KO clones (padj<0.05)")
+grid::popViewport()
+grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 2))
+draw_venn2(sig_SL25, sig_SL45, c("SL25", "SL45"), c("#e6550d", "#e6550d"), "DEL clones (padj<0.05)")
+grid::popViewport()
+
+png(file.path(output_base, "figures", "venn_clones.png"), width = 10, height = 5, units = "in", res = 150)
+grid::grid.newpage()
+grid::pushViewport(grid::viewport(layout = grid::grid.layout(1, 2)))
+grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 1))
+draw_venn2(sig_KO56, sig_KO67, c("KO56", "KO67"), c("#2ca25f", "#2ca25f"), "KO clones (padj<0.05)")
+grid::popViewport()
+grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 2))
+draw_venn2(sig_SL25, sig_SL45, c("SL25", "SL45"), c("#e6550d", "#e6550d"), "DEL clones (padj<0.05)")
+grid::popViewport()
+dev.off()
+
+#' ### Between Conditions (KO vs DEL, family-level, directional)
+
+#' Proper Venn scaling breaks down when one set is far larger than the other
+#' (KO vs DEL here) -- the smaller circle disappears. Shown as a Venn for
+#' reference, plus the same stacked-bar version underneath, which stays readable
+#' regardless of the size imbalance.
+
+# ---- venn-conditions -------------------------------------------------------
+#| echo: false
+#| fig-width: 10
+#| fig-height: 5
+deg_set <- function(df, dir) {
+  d <- df %>% filter(!is.na(padj), padj < alpha, abs(log2FoldChange) > lfc_cutoff)
+  if (dir == "up") d$gene_id[d$log2FoldChange > 0] else d$gene_id[d$log2FoldChange < 0]
+}
+KO_up   <- deg_set(res_KO_df,  "up");  KO_down  <- deg_set(res_KO_df,  "down")
+DEL_up  <- deg_set(res_DEL_df, "up");  DEL_down <- deg_set(res_DEL_df, "down")
+
+grid::grid.newpage()
+grid::pushViewport(grid::viewport(layout = grid::grid.layout(1, 2)))
+grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 1))
+draw_venn2(KO_up, DEL_up, c("KO", "DEL"), c("#A23B72", "#F18F01"), "UP")
+grid::popViewport()
+grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 2))
+draw_venn2(KO_down, DEL_down, c("KO", "DEL"), c("#A23B72", "#F18F01"), "DOWN")
+grid::popViewport()
+
+png(file.path(output_base, "figures", "venn_conditions.png"), width = 10, height = 5, units = "in", res = 150)
+grid::grid.newpage()
+grid::pushViewport(grid::viewport(layout = grid::grid.layout(1, 2)))
+grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 1))
+draw_venn2(KO_up, DEL_up, c("KO", "DEL"), c("#A23B72", "#F18F01"), "UP")
+grid::popViewport()
+grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 2))
+draw_venn2(KO_down, DEL_down, c("KO", "DEL"), c("#A23B72", "#F18F01"), "DOWN")
+grid::popViewport()
+dev.off()
+
+# ---- overlap-bars ----------------------------------------------------------
+#| echo: false
+#| fig-width: 9
+#| fig-height: 6
+bg <- length(intersect(res_KO_df$gene_id, res_DEL_df$gene_id))
+overlap_stat <- function(a, b, tag) {
+  shared <- intersect(a, b)
+  p <- phyper(length(shared) - 1, length(a), bg - length(a), length(b), lower.tail = FALSE)
+  cat(sprintf("%s: KO=%d, DEL=%d, shared=%d, hypergeometric p=%.3g\n",
+              tag, length(a), length(b), length(shared), p))
+  data.frame(direction = tag, KO_only = length(setdiff(a, b)),
+             DEL_only = length(setdiff(b, a)), Shared = length(shared))
+}
+overlap_df <- bind_rows(overlap_stat(KO_up, DEL_up, "UP"), overlap_stat(KO_down, DEL_down, "DOWN"))
+
+overlap_long <- overlap_df %>%
+  pivot_longer(-direction, names_to = "category", values_to = "n_genes") %>%
+  mutate(category = factor(category, levels = c("KO_only", "Shared", "DEL_only")))
+
+p_overlap <- ggplot(overlap_long, aes(direction, n_genes, fill = category)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = n_genes), position = position_stack(vjust = 0.5), size = 3.5) +
+  scale_fill_manual(values = c(KO_only = "#A23B72", Shared = "#6A994E", DEL_only = "#F18F01")) +
+  theme_bw() +
+  labs(x = NULL, y = "Number of genes", fill = NULL, title = "KO vs DEL gene overlap by direction")
+p_overlap
+ggsave(file.path(output_base, "figures", "overlap_bars_KO_vs_DEL.png"), p_overlap, width = 9, height = 6)
+
+write.csv(overlap_df, file.path(output_base, "tables", "gene_overlap_KO_vs_DEL_by_direction.csv"), row.names = FALSE)
+
+#' ## Core Genes: DE in All Four Clones
+
+#' The most robust, clone-independent SMARCE1-responsive genes -- significant in
+#' KO56, KO67, SL25, AND SL45 individually.
+
+# ---- core-four-clones ------------------------------------------------------
+#| echo: false
+clone_sig <- function(res_obj) {
+  d <- as.data.frame(res_obj) %>% rownames_to_column("gene_id") %>%
+    filter(!is.na(padj), padj < 0.05, abs(log2FoldChange) > lfc_cutoff)
+  d$gene_id
+}
+core_all4 <- Reduce(intersect, list(
+  clone_sig(res_KO56), clone_sig(res_KO67), clone_sig(res_SL25), clone_sig(res_SL45)
+))
+cat("Genes DE in all four clones:", length(core_all4), "\n")
+if (length(core_all4) > 0) {
+  core_all4_df <- data.frame(gene_id = core_all4, symbol = sym[core_all4])
+  knitr::kable(core_all4_df, caption = "Core genes DE in KO56, KO67, SL25, and SL45")
+  write.csv(core_all4_df, file.path(output_base, "tables", "core_genes_all_four_clones.csv"), row.names = FALSE)
+}
+
+#' ## SMARCE1 Expression and Top Differentially Expressed Genes
+
+#' First, SMARCE1 itself -- normalized counts per sample, grouped by clone.
+
+# ---- smarce1-expr ----------------------------------------------------------
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+norm_counts_all <- counts(dds, normalized = TRUE)
+SMARCE1_ID <- names(sym)[sym == "SMARCE1"][1]
+
+if (!is.na(SMARCE1_ID) && SMARCE1_ID %in% rownames(norm_counts_all)) {
+  p_smarce1 <- data.frame(sample_id = colnames(norm_counts_all), genotype = samples$genotype,
+             count = norm_counts_all[SMARCE1_ID, ]) %>%
+    ggplot(aes(genotype, count, color = genotype)) +
+    geom_jitter(width = 0.1, size = 3, show.legend = FALSE) +
+    theme_bw() +
+    labs(y = "Normalized counts", x = "", title = "SMARCE1")
+  p_smarce1
+  ggsave(file.path(output_base, "figures", "SMARCE1_expression_by_genotype.png"), p_smarce1, width = 7, height = 5)
+} else {
+  cat("SMARCE1 not found in count matrix -- check tx2gene mapping.\n")
+}
+
+#' Gene-level counts sum reads across all exons, so this reflects total transcript
+#' abundance and can't distinguish an isoform-specific effect from no effect at
+#' all -- that question needs isoform-level quantification (QAPA), not this view.
+
+#' ### Top 10 Up and Top 10 Down, KO and DEL
+
+# ---- top-genes-function ----------------------------------------------------
+#| include: false
+# Plotting functions loaded from R/plotting_functions.R
+
+# ---- top10-KO-up -----------------------------------------------------------
+#| echo: false
+#| fig-width: 14
+#| fig-height: 6
+png(file.path(output_base, "figures", "top10_KO_up.png"), width = 14, height = 6, units = "in", res = 150)
+plot_top_panel(res_KO_df, "KO", "up")
+dev.off()
+plot_top_panel(res_KO_df, "KO", "up")
+
+# ---- top10-KO-down ---------------------------------------------------------
+#| echo: false
+#| fig-width: 14
+#| fig-height: 6
+png(file.path(output_base, "figures", "top10_KO_down.png"), width = 14, height = 6, units = "in", res = 150)
+plot_top_panel(res_KO_df, "KO", "down")
+dev.off()
+plot_top_panel(res_KO_df, "KO", "down")
+
+# ---- top10-DEL-up ----------------------------------------------------------
+#| echo: false
+#| fig-width: 14
+#| fig-height: 6
+png(file.path(output_base, "figures", "top10_DEL_up.png"), width = 14, height = 6, units = "in", res = 150)
+plot_top_panel(res_DEL_df, "DEL", "up")
+dev.off()
+plot_top_panel(res_DEL_df, "DEL", "up")
+
+# ---- top10-DEL-down --------------------------------------------------------
+#| echo: false
+#| fig-width: 14
+#| fig-height: 6
+png(file.path(output_base, "figures", "top10_DEL_down.png"), width = 14, height = 6, units = "in", res = 150)
+plot_top_panel(res_DEL_df, "DEL", "down")
+dev.off()
+plot_top_panel(res_DEL_df, "DEL", "down")
+
+#' # Directional GO Enrichment (UP / DOWN separately)
+
+# ---- directional-go-function -----------------------------------------------
+#| include: false
+# GO enrichment was run once in scripts/02_run_enrichment.R
+
+#' ## KO: UP vs DOWN
+
+# ---- go-KO -----------------------------------------------------------------
+#| echo: false
+#| fig-width: 10
+#| fig-height: 8
+if (!is.null(go_KO$up) && nrow(go_KO$up) > 0) {
+  png(file.path(output_base, "figures", "GO_KO_up.png"), width = 10, height = 8, units = "in", res = 150)
+  print(dotplot(go_KO$up, showCategory = 15, title = "KO UP"))
+  dev.off()
+  print(dotplot(go_KO$up, showCategory = 15, title = "KO UP"))
+  write.csv(as.data.frame(go_KO$up), file.path(output_base, "tables", "GO_KO_up.csv"), row.names = FALSE)
+}
+if (!is.null(go_KO$down) && nrow(go_KO$down) > 0) {
+  png(file.path(output_base, "figures", "GO_KO_down.png"), width = 10, height = 8, units = "in", res = 150)
+  print(dotplot(go_KO$down, showCategory = 15, title = "KO DOWN"))
+  dev.off()
+  print(dotplot(go_KO$down, showCategory = 15, title = "KO DOWN"))
+  write.csv(as.data.frame(go_KO$down), file.path(output_base, "tables", "GO_KO_down.csv"), row.names = FALSE)
+}
+
+#' ## DEL: UP vs DOWN
+
+# ---- go-DEL ----------------------------------------------------------------
+#| echo: false
+#| fig-width: 10
+#| fig-height: 8
+if (!is.null(go_DEL$up) && nrow(go_DEL$up) > 0) {
+  png(file.path(output_base, "figures", "GO_DEL_up.png"), width = 10, height = 8, units = "in", res = 150)
+  print(dotplot(go_DEL$up, showCategory = 15, title = "DEL UP"))
+  dev.off()
+  print(dotplot(go_DEL$up, showCategory = 15, title = "DEL UP"))
+  write.csv(as.data.frame(go_DEL$up), file.path(output_base, "tables", "GO_DEL_up.csv"), row.names = FALSE)
+}
+if (!is.null(go_DEL$down) && nrow(go_DEL$down) > 0) {
+  png(file.path(output_base, "figures", "GO_DEL_down.png"), width = 10, height = 8, units = "in", res = 150)
+  print(dotplot(go_DEL$down, showCategory = 15, title = "DEL DOWN"))
+  dev.off()
+  print(dotplot(go_DEL$down, showCategory = 15, title = "DEL DOWN"))
+  write.csv(as.data.frame(go_DEL$down), file.path(output_base, "tables", "GO_DEL_down.csv"), row.names = FALSE)
+}
+
+#' # GSEA (Wald-Ranked), KO and DEL
+
+# ---- gsea-function ---------------------------------------------------------
+#| include: false
+# GSEA was run once in scripts/02_run_enrichment.R
+
+# ---- run-gsea --------------------------------------------------------------
+#| echo: false
+cat("KO GSEA pathways:", nrow(gsea_KO), "| DEL GSEA pathways:", nrow(gsea_DEL), "\n")
+
+write.csv(as.data.frame(gsea_KO), file.path(output_base, "tables", "GSEA_KO.csv"), row.names = FALSE)
+write.csv(as.data.frame(gsea_DEL), file.path(output_base, "tables", "GSEA_DEL.csv"), row.names = FALSE)
+
+#' ## GSEA Signed-Significance Bubble Plot (Wald-ranked)
+
+#' Pathways plotted by signed -log10(adjusted p-value): positive = upregulated & significant, negative = downregulated & significant. Dot size = core enrichment gene count.
+
+# ---- gsea-bubble -----------------------------------------------------------
+#| echo: false
+#| fig-width: 12
+#| fig-height: 10
+
+gsea_list <- list(KO = gsea_KO, DEL = gsea_DEL)
+combined_results <- data.frame()
+for (name in names(gsea_list)) {
+  if (nrow(gsea_list[[name]]) > 0) {
+    temp <- gsea_list[[name]]@result %>% mutate(Comparison = name) %>%
+      dplyr::select(Comparison, ID, Description, NES, pvalue, p.adjust, setSize)
+    combined_results <- rbind(combined_results, temp)
+  }
+}
+
+if (nrow(combined_results) > 0) {
+  combined_results <- combined_results %>%
+    mutate(signed_log_p = sign(NES) * (-log10(p.adjust)),
+           Comparison = factor(Comparison, levels = c("KO", "DEL")))
+
+  top_pathways <- combined_results %>% group_by(Description) %>%
+    summarise(n = n(), avg_sig = mean(abs(signed_log_p))) %>%
+    arrange(desc(n), desc(avg_sig)) %>% head(40) %>% pull(Description)
+
+  plot_data <- combined_results %>% filter(Description %in% top_pathways) %>%
+    group_by(Description) %>% mutate(avg_NES = mean(NES)) %>% ungroup() %>%
+    mutate(Description = reorder(Description, avg_NES))
+
+  ggplot(plot_data, aes(signed_log_p, Description)) +
+    geom_point(aes(size = setSize, color = NES)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_color_gradient2(low = "blue3", mid = "white", high = "red3", midpoint = 0, name = "NES") +
+    scale_size_continuous(range = c(2, 8), name = "Core\nGenes") +
+    facet_wrap(~ Comparison, ncol = 2, scales = "free_x") +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = 8), strip.background = element_rect(fill = "gray90")) +
+    labs(x = "Signed -log10(adjusted p-value)", y = "Pathway",
+         title = "GSEA Pathway Enrichment: KO vs DEL") -> p_gsea_bubble
+  print(p_gsea_bubble)
+  ggsave(file.path(output_base, "figures", "GSEA_bubble_KO_vs_DEL.png"), p_gsea_bubble, width = 12, height = 10)
+  write.csv(combined_results, file.path(output_base, "tables", "GSEA_combined_KO_DEL.csv"), row.names = FALSE)
+}
+
+#' ## Condensed GSEA Bubble Plot (Semantically Clustered)
+
+#' The plot above shows the top 40 pathways by frequency/significance across KO
+#' and DEL, which is often dominated by near-duplicate terms (e.g. multiple
+#' ribosomal-subunit entries, multiple ion-channel entries) that crowd out other
+#' real but less redundant signal. This version starts from a much larger pool
+#' and collapses semantically similar terms into single representative clusters
+#' before plotting.
+
+#' **Method (for reporting):**
+
+#' 1. From the *full* GSEA result for each group (KO, DEL) -- not the
+#'    pre-filtered top 40 above -- take the top 100 upregulated terms (NES > 0)
+#'    and top 100 downregulated terms (NES < 0), each ranked by ascending
+#'    `p.adjust`. This gives a pool of up to 200 terms per group.
+#' 2. Compute pairwise GO semantic similarity among that pooled set of term IDs
+#'    using `rrvgo::calculateSimMatrix()` (ontology = BP, method = "Rel",
+#'    `org.Hs.eg.db`).
+#' 3. Cluster terms with `rrvgo::reduceSimMatrix()` at a similarity threshold of
+#'    0.7 (terms more similar than 0.7 are merged into the same cluster), scoring
+#'    each term by `-log10(p.adjust)` so more significant terms are preferentially
+#'    kept as cluster representatives ("parent terms").
+#' 4. Within each cluster, keep only the single most significant original term
+#'    (lowest `p.adjust`) as the representative row; its own NES, p.adjust, and
+#'    setSize are what gets plotted.
+#' 5. Across the condensed KO and DEL cluster sets combined, rank clusters by
+#'    (a) how many groups they appear in, then (b) mean `|signed -log10(p.adjust)|`,
+#'    and keep the top 60 clusters for the plot.
+
+# ---- gsea-bubble-condensed -------------------------------------------------
+#| echo: false
+#| fig-width: 12
+#| fig-height: 12
+
+condense_gsea <- function(gsea_obj, tag, n_top = 100, sim_threshold = 0.7) {
+  df <- as.data.frame(gsea_obj)
+  if (nrow(df) == 0) return(NULL)
+
+  top_up   <- df %>% filter(NES > 0) %>% arrange(p.adjust) %>% slice_head(n = n_top)
+  top_down <- df %>% filter(NES < 0) %>% arrange(p.adjust) %>% slice_head(n = n_top)
+  top_pool <- bind_rows(top_up, top_down)
+  if (nrow(top_pool) == 0) return(NULL)
+
+  sim_matrix <- calculateSimMatrix(top_pool$ID, orgdb = "org.Hs.eg.db", ont = "BP", method = "Rel")
+  scores <- setNames(-log10(top_pool$p.adjust), top_pool$ID)
+  reduced <- reduceSimMatrix(sim_matrix, scores, threshold = sim_threshold, orgdb = "org.Hs.eg.db")
+
+  # keep the single most significant original term per cluster as the
+  # representative row (its own NES, p.adjust, setSize carry through)
+  reduced_best <- reduced %>%
+    left_join(top_pool, by = c("go" = "ID")) %>%
+    group_by(parentTerm) %>%
+    slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(Comparison = tag)
+
+  reduced_best
+}
+
+condensed_KO  <- condense_gsea(gsea_KO,  "KO")
+condensed_DEL <- condense_gsea(gsea_DEL, "DEL")
+condensed_combined <- bind_rows(condensed_KO, condensed_DEL)
+
+if (nrow(condensed_combined) > 0) {
+  condensed_combined <- condensed_combined %>%
+    mutate(signed_log_p = sign(NES) * (-log10(p.adjust)),
+           Comparison = factor(Comparison, levels = c("KO", "DEL")))
+
+  top_condensed <- condensed_combined %>%
+    group_by(parentTerm) %>%
+    summarise(n = n(), avg_sig = mean(abs(signed_log_p))) %>%
+    arrange(desc(n), desc(avg_sig)) %>%
+    head(60) %>%
+    pull(parentTerm)
+
+  plot_data_condensed <- condensed_combined %>%
+    filter(parentTerm %in% top_condensed) %>%
+    group_by(parentTerm) %>%
+    mutate(avg_NES = mean(NES)) %>%
+    ungroup() %>%
+    mutate(parentTerm = reorder(parentTerm, avg_NES))
+
+  cat("Condensed clusters shown -- KO:", nrow(condensed_KO),
+      "| DEL:", nrow(condensed_DEL), "\n")
+
+  p_gsea_bubble_condensed <- ggplot(plot_data_condensed, aes(signed_log_p, parentTerm)) +
+    geom_point(aes(size = setSize, color = NES)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_color_gradient2(low = "blue3", mid = "white", high = "red3", midpoint = 0, name = "NES") +
+    scale_size_continuous(range = c(2, 8), name = "Core\nGenes") +
+    facet_wrap(~ Comparison, ncol = 2, scales = "free_x") +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = 8), strip.background = element_rect(fill = "gray90")) +
+    labs(x = "Signed -log10(adjusted p-value)", y = "Pathway cluster",
+         title = "Condensed GSEA Pathway Enrichment: KO vs DEL",
+         subtitle = "Top 100 up + top 100 down per group, semantically clustered (rrvgo, threshold = 0.7)")
+  print(p_gsea_bubble_condensed)
+  ggsave(file.path(output_base, "figures", "GSEA_bubble_condensed_KO_vs_DEL.png"),
+         p_gsea_bubble_condensed, width = 12, height = 12)
+  write.csv(condensed_combined, file.path(output_base, "tables", "GSEA_condensed_clusters_KO_DEL.csv"), row.names = FALSE)
+}
+
+#' # Combined GO + GSEA, and Neural Pathway Focus
+
+#' ## Merged GO (ORA) and GSEA Results
+
+#' A term found significant in *both* the threshold-based (ORA, uses only your
+#' significant genes) and rank-based (GSEA, uses the full ranked list) analyses
+#' is more robust than one found in only one.
+
+# ---- merge-go-gsea ---------------------------------------------------------
+#| echo: false
+knitr::kable(head(merged_all, 20), caption = "Top merged ORA and GSEA results")
+write.csv(merged_all, file.path(output_base, "tables", "merged_GO_GSEA_all.csv"), row.names = FALSE)
+
+#' ## Condensed Bubble Plot: Terms Robust to Both ORA and GSEA
+
+#' Terms significant by *both* independent methods (threshold-based ORA and
+#' rank-based GSEA) are the most trustworthy pathway hits. Same
+#' semantic-clustering treatment as the condensed GSEA-only plot above, applied
+#' to just this smaller, high-confidence set -- so there is no need to cap it at
+#' a top-N; every term already passed two independent significance filters
+#' before clustering.
+
+#' **Method (for reporting):**
+
+#' 1. Start from `merged_all`, keep only rows where a term (matched on GO ID,
+#'    Description, condition/group, and direction) is significant in *both*
+#'    the ORA (`enrichGO`) result and the GSEA (`gseGO`) result -- i.e.
+#'    `!is.na(ora_padj) & !is.na(gsea_padj)`.
+#' 2. Deduplicate to one row per (GO ID, condition) pair.
+#' 3. Compute GO semantic similarity among this in-both term set the same way
+#'    as above (`rrvgo::calculateSimMatrix()`, ontology = BP, method = "Rel"),
+#'    scoring each term by `-log10(best p-value across ORA/GSEA)`.
+#' 4. Cluster with `reduceSimMatrix()` at the same 0.7 similarity threshold, then
+#'    within each (cluster x condition) combination keep only the single most
+#'    significant term as the representative row.
+#' 5. Plot every resulting cluster (no additional top-N filtering) -- x-axis is
+#'    signed `-log10(GSEA adjusted p-value)`, dot size is `-log10(ORA adjusted
+#'    p-value)`, color is NES.
+
+# ---- merged-bubble-condensed -----------------------------------------------
+#| echo: false
+#| fig-width: 12
+#| fig-height: 10
+
+in_both_terms <- merged_all %>%
+  mutate(in_both = !is.na(ora_padj) & !is.na(gsea_padj)) %>%
+  filter(in_both) %>%
+  distinct(ID, condition, .keep_all = TRUE)
+
+if (nrow(in_both_terms) > 0) {
+  sim_matrix_ib <- calculateSimMatrix(unique(in_both_terms$ID), orgdb = "org.Hs.eg.db",
+                                       ont = "BP", method = "Rel")
+  scores_ib <- in_both_terms %>%
+    group_by(ID) %>%
+    summarise(best_p = min(gsea_padj, na.rm = TRUE)) %>%
+    { setNames(-log10(.$best_p), .$ID) }
+
+  reduced_ib <- reduceSimMatrix(sim_matrix_ib, scores_ib, threshold = 0.7, orgdb = "org.Hs.eg.db")
+
+  in_both_condensed <- reduced_ib %>%
+    left_join(in_both_terms, by = c("go" = "ID")) %>%
+    group_by(parentTerm, condition) %>%
+    slice_min(gsea_padj, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(signed_log_p = sign(NES) * (-log10(gsea_padj)),
+           condition = factor(condition, levels = c("KO", "DEL")))
+
+  cat("Condensed in-both clusters -- KO:", sum(in_both_condensed$condition == "KO", na.rm = TRUE),
+      "| DEL:", sum(in_both_condensed$condition == "DEL", na.rm = TRUE), "\n")
+
+  p_merged_bubble_condensed <- ggplot(in_both_condensed, aes(signed_log_p, reorder(parentTerm, signed_log_p))) +
+    geom_point(aes(size = -log10(ora_padj), color = NES)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_color_gradient2(low = "blue3", mid = "white", high = "red3", midpoint = 0, name = "NES") +
+    scale_size_continuous(range = c(2, 8), name = "-log10\n(ORA padj)") +
+    facet_wrap(~ condition, ncol = 2, scales = "free_x") +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = 8), strip.background = element_rect(fill = "gray90")) +
+    labs(x = "Signed -log10(GSEA adjusted p-value)", y = "Pathway cluster",
+         title = "Condensed high-confidence pathways (significant in both ORA and GSEA): KO vs DEL")
+  print(p_merged_bubble_condensed)
+  ggsave(file.path(output_base, "figures", "merged_bubble_condensed_KO_vs_DEL.png"),
+         p_merged_bubble_condensed, width = 12, height = 10)
+  write.csv(in_both_condensed, file.path(output_base, "tables", "merged_condensed_clusters_KO_DEL.csv"), row.names = FALSE)
+}
+
+#' ## Neural / Neurodevelopmental Pathways
+
+#' Filtered from the merged table above by keyword match on pathway description.
+
+# ---- neural-pathways -------------------------------------------------------
+#| echo: false
+#| fig-width: 10
+#| fig-height: 8
+neural_keywords <- "neuro|neural|neuron|ectoderm|axon|synap|nervous system"
+
+neural_terms <- merged_all %>%
+  filter(str_detect(tolower(Description), neural_keywords)) %>%
+  distinct(ID, Description, condition, direction, .keep_all = TRUE)
+
+cat("Neural-related terms found:", nrow(neural_terms), "\n")
+knitr::kable(neural_terms %>% dplyr::select(condition, direction, Description, ora_padj, NES, gsea_padj),
+             digits = 4, caption = "Neural/neurodevelopmental GO terms, KO and DEL")
+write.csv(neural_terms, file.path(output_base, "tables", "neural_pathways_KO_DEL.csv"), row.names = FALSE)
+
+if (nrow(neural_terms) > 0) {
+  p_neural <- neural_terms %>% filter(!is.na(NES)) %>%
+    mutate(signed_log_p = sign(NES) * -log10(gsea_padj)) %>%
+    ggplot(aes(signed_log_p, reorder(Description, signed_log_p), color = NES)) +
+    geom_point(size = 4) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_color_gradient2(low = "blue3", mid = "white", high = "red3", midpoint = 0) +
+    facet_wrap(~condition, scales = "free_x") +
+    theme_bw() +
+    labs(x = "Signed -log10(adjusted p-value)", y = NULL,
+         title = "Neural/neurodevelopmental pathways: KO vs DEL")
+  print(p_neural)
+  ggsave(file.path(output_base, "figures", "neural_pathways_KO_DEL.png"), p_neural, width = 10, height = 8)
+}
+
+#' # Semantic Clustering of Neural GO Terms
+
+#' The neural-filtered GSEA result above has 126 rows -- too many overlapping,
+#' redundant terms (e.g. "axon guidance" and "axon development") to read as a
+#' flat list. Three standard, non-ML semantic-similarity approaches, all based on
+#' GO's own hierarchical structure (not a trained model):
+
+#' ## Method 1: `clusterProfiler::simplify()`
+
+#' Collapses redundant terms using semantic similarity, keeping one
+#' representative term per similar cluster.
+
+# ---- simplify-go -----------------------------------------------------------
+#| echo: false
+cat("KO GSEA terms before simplify():", nrow(gsea_KO), "\n")
+cat("KO GSEA terms after simplify():", nrow(gsea_KO_simplified), "\n")
+simplify_neural <- as.data.frame(gsea_KO_simplified) %>%
+  filter(str_detect(tolower(Description), "neuro|neural|neuron|axon|synap")) %>%
+  dplyr::select(Description, NES, p.adjust) %>% arrange(p.adjust)
+knitr::kable(simplify_neural, digits = 4, caption = "Simplified neural terms (KO)")
+write.csv(simplify_neural, file.path(output_base, "tables", "simplify_neural_terms_KO.csv"), row.names = FALSE)
+
+#' ## Method 2: `rrvgo` Semantic Clustering + Treemap
+
+#' Groups terms into clusters based on semantic similarity and visualizes as a
+#' treemap, sized by significance.
+
+# ---- rrvgo-cluster ---------------------------------------------------------
+#| echo: false
+#| fig-width: 10
+#| fig-height: 7
+cat("Reduced to", length(unique(reducedTerms$parentTerm)), "parent clusters\n")
+png(file.path(output_base, "figures", "rrvgo_treemap_KO.png"), width = 10, height = 7, units = "in", res = 150)
+treemapPlot(reducedTerms, title = "KO GSEA terms, semantically clustered")
+dev.off()
+treemapPlot(reducedTerms, title = "KO GSEA terms, semantically clustered")
+
+# ---- rrvgo-neural-clusters -------------------------------------------------
+#| echo: false
+neural_clusters <- reducedTerms %>%
+  filter(str_detect(tolower(term), "neuro|neural|neuron|axon|synap") |
+         str_detect(tolower(parentTerm), "neuro|neural|neuron|axon|synap"))
+neural_clusters_out <- neural_clusters %>% dplyr::select(term, parentTerm, score) %>% arrange(desc(score))
+knitr::kable(neural_clusters_out, caption = "Neural-related terms and their parent cluster (rrvgo)")
+write.csv(neural_clusters_out, file.path(output_base, "tables", "rrvgo_neural_clusters_KO.csv"), row.names = FALSE)
+
+#' ## Method 3: Term Similarity Network (`enrichplot::treeplot`)
+
+#' Same underlying idea, shown as a dendrogram/network so related terms visually
+#' group into branches -- useful for seeing whether KO and DEL's neural terms
+#' cluster the same way or diverge into different branches (relevant given DEL
+#' showed several synaptic terms UP while KO showed them DOWN).
+
+# ---- treeplot --------------------------------------------------------------
+#| echo: false
+#| fig-width: 11
+#| fig-height: 9
+png(file.path(output_base, "figures", "treeplot_KO_neural_terms.png"), width = 11, height = 9, units = "in", res = 150)
+print(treeplot(gsea_KO_pt, showCategory = 40, nCluster = 6))
+dev.off()
+treeplot(gsea_KO_pt, showCategory = 40, nCluster = 6)
+
+#' # Expression Heatmap
+
+#' The earlier version selected genes by |log2FC| and let columns cluster freely
+#' -- with many genes and 20 samples that produces a visually messy, hard-to-read
+#' figure. Standard practice: select a manageable number of genes by significance
+#' (padj, not fold-change magnitude, since padj accounts for both effect size and
+#' noise), fix the sample (column) order to genotype instead of letting them
+#' cluster freely, and only cluster rows. VST-transformed, row Z-scored as before.
+
+# ---- heatmap ---------------------------------------------------------------
+#| echo: false
+#| fig-width: 9
+#| fig-height: 10
+top_KO  <- res_KO_df  %>% filter(!is.na(padj), padj < alpha) %>% arrange(padj) %>% slice_head(n = 25) %>% pull(gene_id)
+top_DEL <- res_DEL_df %>% filter(!is.na(padj), padj < alpha) %>% arrange(padj) %>% slice_head(n = 25) %>% pull(gene_id)
+heat_genes <- union(top_KO, top_DEL)
+cat("Genes shown:", length(heat_genes), "(top 25 by padj from KO, top 25 from DEL, unioned)\n")
+
+vst_all <- assay(vsd)
+
+# Fix sample order by genotype so columns don't cluster into a jumbled order
+genotype_order <- c("WT", "del1", "del2", "null1", "null2")   # WT, DEL, KO
+sample_order <- samples$sample_id[order(match(samples$genotype, genotype_order))]
+mat <- vst_all[heat_genes, sample_order]
+
+# Drop genes with zero variance (they turn into NA/NaN after scaling and break clustering)
+# Drop genes with any missing values, then drop genes with zero variance
+mat <- mat[complete.cases(mat), ]
+mat <- mat[apply(mat, 1, sd) > 0, ]
+
+mat_z <- t(scale(t(mat)))
+rownames(mat_z) <- sym[rownames(mat_z)]
+
+anno_col <- data.frame(Genotype = factor(samples$genotype, levels = genotype_order),
+                        row.names = samples$sample_id)[sample_order, , drop = FALSE]
+
+pheatmap(mat_z,
+         annotation_col = anno_col,
+         cluster_cols = FALSE,          # keep genotype order, don't let columns re-cluster
+         cluster_rows = TRUE,           # still group genes with similar patterns
+         show_rownames = TRUE, fontsize_row = 7,
+         gaps_col = cumsum(table(anno_col$Genotype)[genotype_order])[-length(genotype_order)],
+         clustering_method = "ward.D2",
+         color = colorRampPalette(c("blue3", "white", "red3"))(100),
+         main = "Top 25 genes by padj, KO + DEL (columns fixed by genotype)")
+
+pheatmap(mat_z,
+         annotation_col = anno_col,
+         cluster_cols = FALSE,
+         cluster_rows = TRUE,
+         show_rownames = TRUE, fontsize_row = 7,
+         gaps_col = cumsum(table(anno_col$Genotype)[genotype_order])[-length(genotype_order)],
+         clustering_method = "ward.D2",
+         color = colorRampPalette(c("blue3", "white", "red3"))(100),
+         main = "Top 25 genes by padj, KO + DEL (columns fixed by genotype)",
+         filename = file.path(output_base, "figures", "heatmap_top25_KO_DEL.png"),
+         width = 9, height = 10)
+
+write.csv(data.frame(gene_id = heat_genes, symbol = sym[heat_genes]),
+          file.path(output_base, "tables", "heatmap_top25_KO_DEL_genes.csv"), row.names = FALSE)
+
+#' # Does the 3'UTR-Deletion Response Change During Neuronal Differentiation?
+
+#' The hESC analysis shows that complete SMARCE1 loss produces a broad
+#' transcriptional phenotype, whereas the 3'UTR deletion has a much smaller
+#' immediate effect. The 5-week neuron data allow a separate developmental
+#' question: do reproducible DEL responses emerge after differentiation, and do
+#' those responses resemble hESC KO, persist from hESC DEL, or represent
+#' neuron-stage-specific effects?
+
+#' **Caveat:** hESC and 5-week data were generated in separate experiments with
+#' separate WT controls. Therefore, the analysis compares gene identity,
+#' direction, and within-experiment log2 fold changes. It does not treat the four
+#' contrasts as one statistical model or directly compare raw expression values
+#' between experiments.
+
+# ---- load-5wk-data ---------------------------------------------------------
+sl25_5wk <- read.csv(here::here("data", "5wk_del", "SL25_vs_H9_full_results.csv")) %>%
+  mutate(ensembl_base = sub("\\..*$", "", gene_id))
+sl45_5wk <- read.csv(here::here("data", "5wk_del", "SL45_vs_H9_full_results.csv")) %>%
+  mutate(ensembl_base = sub("\\..*$", "", gene_id))
+go_sl25_5wk   <- read.csv(here::here("data", "5wk_del", "SL25_vs_H9_GO_enrichment.csv"))
+go_sl45_5wk   <- read.csv(here::here("data", "5wk_del", "SL45_vs_H9_GO_enrichment.csv"))
+gsea_sl25_5wk <- read.csv(here::here("data", "5wk_del", "SL25_vs_H9_GSEA.csv"))
+gsea_sl45_5wk <- read.csv(here::here("data", "5wk_del", "SL45_vs_H9_GSEA.csv"))
+
+sig_5wk <- function(df) {
+  unique(df$ensembl_base[
+    !is.na(df$padj) & df$padj < alpha & abs(df$log2FoldChange) > lfc_cutoff
+  ])
+}
+
+sig_SL25_5wk <- sig_5wk(sl25_5wk)
+sig_SL45_5wk <- sig_5wk(sl45_5wk)
+sig_DEL_5wk_union <- union(sig_SL25_5wk, sig_SL45_5wk)
+sig_DEL_5wk_both <- intersect(sig_SL25_5wk, sig_SL45_5wk)
+
+cat("5wk SL25 significant genes:", length(sig_SL25_5wk), "\n")
+cat("5wk SL45 significant genes:", length(sig_SL45_5wk), "\n")
+cat("5wk DEL union:", length(sig_DEL_5wk_union), "\n")
+cat("5wk DEL significant in both clones:", length(sig_DEL_5wk_both), "\n")
+
+#' ## Gene-Level Overlap Across Stages
+
+#' Ensembl version suffixes are removed before overlap calculations so that hESC
+#' and 5-week identifiers are compared consistently. Both the permissive 5-week
+#' union and the more reproducible two-clone intersection are reported.
+
+# ---- gene-overlap-stage ----------------------------------------------------
+#| echo: false
+sig_genes_base <- function(df, padj_cut = alpha, lfc_cut = lfc_cutoff) {
+  df %>%
+    filter(!is.na(padj), padj < padj_cut, abs(log2FoldChange) > lfc_cut) %>%
+    transmute(ensembl_base = sub("\\..*$", "", gene_id)) %>%
+    pull(ensembl_base) %>%
+    unique()
+}
+
+sig_KO_hesc <- sig_genes_base(res_KO_df)
+sig_DEL_hesc <- sig_genes_base(res_DEL_df)
+
+shared_universe <- Reduce(intersect, list(
+  sub("\\..*$", "", res_KO_df$gene_id),
+  sl25_5wk$ensembl_base,
+  sl45_5wk$ensembl_base
+))
+
+stage_overlap <- function(reference, comparison, label) {
+  reference <- intersect(reference, shared_universe)
+  comparison <- intersect(comparison, shared_universe)
+  shared <- intersect(reference, comparison)
+  p <- phyper(
+    length(shared) - 1,
+    length(reference),
+    length(shared_universe) - length(reference),
+    length(comparison),
+    lower.tail = FALSE
+  )
+  tibble(
+    comparison = label,
+    reference_n = length(reference),
+    comparison_n = length(comparison),
+    shared_n = length(shared),
+    comparison_shared_pct = 100 * length(shared) / max(length(comparison), 1),
+    p_value = p
+  )
+}
+
+overlap_stage_table <- bind_rows(
+  stage_overlap(sig_KO_hesc, sig_DEL_hesc, "hESC KO vs hESC DEL"),
+  stage_overlap(sig_KO_hesc, sig_DEL_5wk_union, "hESC KO vs 5wk DEL union"),
+  stage_overlap(sig_KO_hesc, sig_DEL_5wk_both, "hESC KO vs 5wk DEL both clones"),
+  stage_overlap(sig_DEL_hesc, sig_DEL_5wk_both, "hESC DEL vs 5wk DEL both clones")
+)
+
+knitr::kable(
+  overlap_stage_table,
+  digits = 3,
+  caption = "Gene-level overlap across hESC and 5-week comparisons"
+)
+write.csv(overlap_stage_table, file.path(output_base, "tables", "gene_overlap_across_stages.csv"), row.names = FALSE)
+
+#' The two-clone intersection is the stronger evidence because it requires the
+#' 5-week response to replicate in both independently edited DEL clones. Overlap
+#' alone does not establish that the direction of change is the same; direction is
+#' addressed in the trajectory analysis below.
+
+#' ## Pathway-Level Check: Do hESC-KO's Neural Terms Show Up in 5wk-DEL?
+
+# ---- pathway-check-stage ---------------------------------------------------
+#| echo: false
+neural_kw <- "neuro|neural|neuron|ectoderm|axon|synap|nervous system"
+
+ko_neural_ids <- as.data.frame(gsea_KO) %>%
+  filter(str_detect(tolower(Description), neural_kw)) %>% pull(ID) %>% unique()
+cat("hESC-KO neural GO terms (reference set):", length(ko_neural_ids), "\n")
+
+check_stage <- function(gsea_df, tag) {
+  hit <- gsea_df %>% filter(ID %in% ko_neural_ids)
+  cat(tag, ": ", nrow(hit), "of hESC-KO's neural terms also appear in this GSEA result\n")
+  hit %>% dplyr::select(ID, Description, NES, p.adjust) %>% arrange(p.adjust)
+}
+sl25_hits <- check_stage(gsea_sl25_5wk, "5wk SL25")
+sl45_hits <- check_stage(gsea_sl45_5wk, "5wk SL45")
+
+pathway_check_out <- bind_rows(sl25_hits %>% mutate(clone = "SL25"), sl45_hits %>% mutate(clone = "SL45"))
+knitr::kable(pathway_check_out, digits = 4, caption = "hESC-KO neural GO terms recovered in 5wk-DEL GSEA")
+write.csv(pathway_check_out, file.path(output_base, "tables", "pathway_check_stage_neural.csv"), row.names = FALSE)
+
+#' ## Cross-Stage Gene Trajectories
+
+#' A single cross-stage table is built for genes measured in all four contrasts:
+#' hESC KO vs WT, hESC DEL vs WT, 5-week SL25 vs H9, and 5-week SL45 vs H9. The
+#' trajectory categories distinguish early, persistent, delayed, opposite, and
+#' clone-specific responses.
+
+# ---- cross-stage-trajectories ----------------------------------------------
+#| echo: false
+#| fig-width: 9
+#| fig-height: 6
+hesc_ko_stage <- res_KO_df %>%
+  mutate(ensembl_base = sub("\\..*$", "", gene_id)) %>%
+  transmute(
+    ensembl_base,
+    symbol_KO = gene_symbol,
+    lfc_hESC_KO = log2FoldChange,
+    padj_hESC_KO = padj
+  ) %>%
+  distinct(ensembl_base, .keep_all = TRUE)
+
+hesc_del_stage <- res_DEL_df %>%
+  mutate(ensembl_base = sub("\\..*$", "", gene_id)) %>%
+  transmute(
+    ensembl_base,
+    symbol_DEL = gene_symbol,
+    lfc_hESC_DEL = log2FoldChange,
+    padj_hESC_DEL = padj
+  ) %>%
+  distinct(ensembl_base, .keep_all = TRUE)
+
+wk5_sl25_stage <- sl25_5wk %>%
+  transmute(
+    ensembl_base,
+    symbol_SL25 = gene_symbol,
+    lfc_5wk_SL25 = log2FoldChange,
+    padj_5wk_SL25 = padj
+  ) %>%
+  distinct(ensembl_base, .keep_all = TRUE)
+
+wk5_sl45_stage <- sl45_5wk %>%
+  transmute(
+    ensembl_base,
+    symbol_SL45 = gene_symbol,
+    lfc_5wk_SL45 = log2FoldChange,
+    padj_5wk_SL45 = padj
+  ) %>%
+  distinct(ensembl_base, .keep_all = TRUE)
+
+stage_all <- hesc_ko_stage %>%
+  inner_join(hesc_del_stage, by = "ensembl_base") %>%
+  inner_join(wk5_sl25_stage, by = "ensembl_base") %>%
+  inner_join(wk5_sl45_stage, by = "ensembl_base") %>%
+  mutate(
+    gene_symbol = coalesce(symbol_KO, symbol_DEL, symbol_SL25, symbol_SL45),
+    sig_hESC_KO = !is.na(padj_hESC_KO) & padj_hESC_KO < alpha &
+      abs(lfc_hESC_KO) > lfc_cutoff,
+    sig_hESC_DEL = !is.na(padj_hESC_DEL) & padj_hESC_DEL < alpha &
+      abs(lfc_hESC_DEL) > lfc_cutoff,
+    sig_5wk_SL25 = !is.na(padj_5wk_SL25) & padj_5wk_SL25 < alpha &
+      abs(lfc_5wk_SL25) > lfc_cutoff,
+    sig_5wk_SL45 = !is.na(padj_5wk_SL45) & padj_5wk_SL45 < alpha &
+      abs(lfc_5wk_SL45) > lfc_cutoff,
+    same_5wk_direction = sign(lfc_5wk_SL25) == sign(lfc_5wk_SL45),
+    mean_5wk_lfc = rowMeans(cbind(lfc_5wk_SL25, lfc_5wk_SL45), na.rm = TRUE),
+    reproducible_5wk = sig_5wk_SL25 & sig_5wk_SL45 & same_5wk_direction,
+    any_5wk = sig_5wk_SL25 | sig_5wk_SL45,
+    same_as_KO = sign(mean_5wk_lfc) == sign(lfc_hESC_KO),
+    same_as_DEL = sign(mean_5wk_lfc) == sign(lfc_hESC_DEL),
+    trajectory = case_when(
+      reproducible_5wk & sig_hESC_KO & sig_hESC_DEL & same_as_KO & same_as_DEL ~
+        "Shared persistent",
+      reproducible_5wk & sig_hESC_DEL & same_as_DEL ~ "Persistent DEL",
+      reproducible_5wk & !sig_hESC_DEL & sig_hESC_KO & same_as_KO ~
+        "Delayed KO-like",
+      reproducible_5wk & !sig_hESC_KO & !sig_hESC_DEL ~
+        "Differentiation-specific DEL",
+      reproducible_5wk & ((sig_hESC_KO & !same_as_KO) |
+        (sig_hESC_DEL & !same_as_DEL)) ~ "Opposite",
+      any_5wk & !reproducible_5wk ~ "Clone-specific 5wk",
+      sig_hESC_KO & !any_5wk ~ "hESC KO-only",
+      sig_hESC_DEL & !any_5wk ~ "hESC DEL-only",
+      TRUE ~ "No classified response"
+    )
+  )
+
+trajectory_counts <- stage_all %>%
+  filter(trajectory != "No classified response") %>%
+  dplyr::count(trajectory, name = "n") %>%
+  arrange(desc(n))
+
+knitr::kable(trajectory_counts, caption = "Cross-stage trajectory category counts")
+write.csv(trajectory_counts, file.path(output_base, "tables", "cross_stage_trajectory_counts.csv"), row.names = FALSE)
+write.csv(stage_all, file.path(output_base, "deg_lists", "cross_stage_full_table.csv"), row.names = FALSE)
+
+p_trajectory <- ggplot(trajectory_counts, aes(x = reorder(trajectory, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = NULL,
+    y = "Number of genes",
+    title = "Cross-stage SMARCE1 response trajectories"
+  )
+p_trajectory
+ggsave(file.path(output_base, "figures", "cross_stage_trajectory_counts.png"), p_trajectory, width = 9, height = 6)
+
+#' ### Cross-Stage Effect-Size Heatmap
+
+#' The heatmap shows up to 50 genes from the biologically informative,
+#' reproducible 5-week categories. Values are log2 fold changes within each
+#' experiment, capped at -4 to 4 for display. Because the experiments have
+#' separate controls, the heatmap is interpreted as a direction-and-effect summary,
+#' not as a shared expression matrix.
+
+# ---- heatmap-stage-comparison ----------------------------------------------
+#| echo: false
+#| fig-width: 10
+#| fig-height: 12
+plot_categories <- c(
+  "Shared persistent",
+  "Persistent DEL",
+  "Delayed KO-like",
+  "Differentiation-specific DEL",
+  "Opposite"
+)
+
+cross_stage <- stage_all %>%
+  filter(trajectory %in% plot_categories) %>%
+  mutate(rank_effect = abs(mean_5wk_lfc)) %>%
+  arrange(desc(rank_effect)) %>%
+  slice_head(n = 50)
+
+cat("Cross-stage genes plotted:", nrow(cross_stage), "\n")
+
+if (nrow(cross_stage) == 0) {
+  cat("No genes met the reproducible cross-stage trajectory criteria.\n")
+} else {
+  cross_stage_mat <- cross_stage %>%
+    dplyr::select(lfc_hESC_KO, lfc_hESC_DEL, lfc_5wk_SL25, lfc_5wk_SL45) %>%
+    as.matrix()
+
+  finite_rows <- apply(cross_stage_mat, 1, function(x) all(is.finite(x)))
+  cross_stage_mat <- cross_stage_mat[finite_rows, , drop = FALSE]
+  cross_stage_plot <- cross_stage[finite_rows, , drop = FALSE]
+  cross_stage_mat <- pmax(pmin(cross_stage_mat, 4), -4)
+
+  gene_labels <- ifelse(
+    is.na(cross_stage_plot$gene_symbol) | cross_stage_plot$gene_symbol == "",
+    cross_stage_plot$ensembl_base,
+    cross_stage_plot$gene_symbol
+  )
+  rownames(cross_stage_mat) <- make.unique(gene_labels)
+  colnames(cross_stage_mat) <- c("hESC KO", "hESC DEL", "5wk SL25", "5wk SL45")
+
+  anno_stage <- data.frame(
+    Trajectory = cross_stage_plot$trajectory,
+    row.names = rownames(cross_stage_mat)
+  )
+
+  if (nrow(cross_stage_mat) == 0) {
+    cat("No finite genes remained for the cross-stage heatmap.\n")
+  } else {
+    pheatmap(
+      cross_stage_mat,
+      annotation_row = anno_stage,
+      show_rownames = TRUE,
+      fontsize_row = 7,
+      cluster_cols = FALSE,
+      cluster_rows = nrow(cross_stage_mat) >= 2,
+      color = colorRampPalette(c("blue3", "white", "red3"))(100),
+      breaks = seq(-4, 4, length.out = 101),
+      main = "Cross-stage log2 fold-change trajectories"
+    )
+    pheatmap(
+      cross_stage_mat,
+      annotation_row = anno_stage,
+      show_rownames = TRUE,
+      fontsize_row = 7,
+      cluster_cols = FALSE,
+      cluster_rows = nrow(cross_stage_mat) >= 2,
+      color = colorRampPalette(c("blue3", "white", "red3"))(100),
+      breaks = seq(-4, 4, length.out = 101),
+      main = "Cross-stage log2 fold-change trajectories",
+      filename = file.path(output_base, "figures", "cross_stage_heatmap.png"),
+      width = 10, height = 12
+    )
+    write.csv(cross_stage_plot, file.path(output_base, "tables", "cross_stage_heatmap_genes.csv"), row.names = FALSE)
+  }
+}
+
+#' ### Representative Cross-Stage Genes
+
+#' Up to five genes per major trajectory are shown below. Ranking is based on the
+#' mean absolute 5-week effect, emphasizing reproducible neuronal-stage responses.
+
+# ---- cross-stage-representative-genes --------------------------------------
+#| echo: false
+representative_stage <- stage_all %>%
+  filter(trajectory %in% plot_categories) %>%
+  mutate(
+    gene = coalesce(gene_symbol, ensembl_base),
+    rank_effect = abs(mean_5wk_lfc)
+  ) %>%
+  group_by(trajectory) %>%
+  arrange(desc(rank_effect), .by_group = TRUE) %>%
+  slice_head(n = 5) %>%
+  ungroup() %>%
+  dplyr::select(
+    trajectory,
+    gene,
+    lfc_hESC_KO,
+    lfc_hESC_DEL,
+    lfc_5wk_SL25,
+    lfc_5wk_SL45
+  )
+
+knitr::kable(
+  representative_stage,
+  digits = 3,
+  caption = "Representative genes from major cross-stage trajectories"
+)
+write.csv(representative_stage, file.path(output_base, "tables", "cross_stage_representative_genes.csv"), row.names = FALSE)
+
+#' # Integrated Cross-Stage Comparison
+
+#' The central developmental question is whether the transcriptional effect of the
+#' SMARCE1 3'UTR deletion changes after neuronal differentiation and whether the
+#' 5-week DEL response becomes more similar to complete SMARCE1 loss. Three
+#' relationships are therefore evaluated using the same gene universe:
+
+#' 1. hESC KO versus hESC DEL;
+#' 2. hESC DEL versus reproducible 5-week DEL;
+#' 3. hESC KO versus reproducible 5-week DEL.
+
+#' The 5-week DEL effect is represented by the mean log2 fold change of SL25 and
+#' SL45. A gene is considered a reproducible 5-week response only when it passes
+#' the significance and effect-size thresholds in both clones and changes in the
+#' same direction. Correlations use all genes measured in all four contrasts and
+#' are therefore complementary to overlap counts based only on thresholded genes.
+
+#' ## Gene Overlap, Direction, and Effect-Size Correlation
+
+# ---- integrated-cross-stage-metrics ----------------------------------------
+#| echo: false
+#| fig-width: 8
+#| fig-height: 6
+#| fig-show: hold
+
+comparison_metrics <- function(df, lfc_a, sig_a, lfc_b, sig_b, label) {
+  a_lfc <- df[[lfc_a]]
+  b_lfc <- df[[lfc_b]]
+  a_sig <- df[[sig_a]] %in% TRUE
+  b_sig <- df[[sig_b]] %in% TRUE
+  finite <- is.finite(a_lfc) & is.finite(b_lfc)
+  shared_sig <- a_sig & b_sig & finite
+  same_direction <- shared_sig & sign(a_lfc) == sign(b_lfc)
+  opposite_direction <- shared_sig & sign(a_lfc) != sign(b_lfc)
+
+  universe_n <- sum(finite)
+  a_n <- sum(a_sig & finite)
+  b_n <- sum(b_sig & finite)
+  shared_n <- sum(shared_sig)
+
+  overlap_p <- if (universe_n > 0 && a_n <= universe_n && b_n <= universe_n) {
+    phyper(shared_n - 1, a_n, universe_n - a_n, b_n, lower.tail = FALSE)
+  } else {
+    NA_real_
+  }
+
+  rho <- if (sum(finite) >= 3) {
+    suppressWarnings(cor(a_lfc[finite], b_lfc[finite], method = "spearman"))
+  } else {
+    NA_real_
+  }
+
+  tibble(
+    comparison = label,
+    universe_genes = universe_n,
+    set_A_significant = a_n,
+    set_B_significant = b_n,
+    shared_significant = shared_n,
+    same_direction = sum(same_direction),
+    opposite_direction = sum(opposite_direction),
+    A_only = sum(a_sig & !b_sig & finite),
+    B_only = sum(!a_sig & b_sig & finite),
+    shared_same_direction_pct = ifelse(shared_n > 0,
+      100 * sum(same_direction) / shared_n, NA_real_),
+    overlap_p = overlap_p,
+    spearman_all_measured = rho
+  )
+}
+
+integrated_gene_summary <- bind_rows(
+  comparison_metrics(
+    stage_all, "lfc_hESC_KO", "sig_hESC_KO",
+    "lfc_hESC_DEL", "sig_hESC_DEL",
+    "hESC KO vs hESC DEL"
+  ),
+  comparison_metrics(
+    stage_all, "lfc_hESC_DEL", "sig_hESC_DEL",
+    "mean_5wk_lfc", "reproducible_5wk",
+    "hESC DEL vs 5wk DEL"
+  ),
+  comparison_metrics(
+    stage_all, "lfc_hESC_KO", "sig_hESC_KO",
+    "mean_5wk_lfc", "reproducible_5wk",
+    "hESC KO vs 5wk DEL"
+  )
+)
+
+knitr::kable(
+  integrated_gene_summary,
+  digits = 3,
+  caption = "Integrated gene-level comparison across hESC and 5-week DEL responses"
+)
+write.csv(integrated_gene_summary, file.path(output_base, "tables", "integrated_gene_summary.csv"), row.names = FALSE)
+
+plot_effect_comparison <- function(df, x_col, y_col, sig_x, sig_y,
+                                   x_label, y_label, title) {
+  plot_df <- df %>%
+    transmute(
+      x = .data[[x_col]],
+      y = .data[[y_col]],
+      shared_sig = (.data[[sig_x]] %in% TRUE) & (.data[[sig_y]] %in% TRUE)
+    ) %>%
+    filter(is.finite(x), is.finite(y))
+
+  rho <- if (nrow(plot_df) >= 3) {
+    suppressWarnings(cor(plot_df$x, plot_df$y, method = "spearman"))
+  } else {
+    NA_real_
+  }
+
+  ggplot(plot_df, aes(x = x, y = y)) +
+    geom_hline(yintercept = 0, linewidth = 0.3, color = "grey70") +
+    geom_vline(xintercept = 0, linewidth = 0.3, color = "grey70") +
+    geom_point(aes(alpha = shared_sig), size = 1.2) +
+    scale_alpha_manual(values = c(`FALSE` = 0.18, `TRUE` = 0.9), guide = "none") +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.6) +
+    coord_cartesian(xlim = c(-6, 6), ylim = c(-6, 6)) +
+    theme_bw() +
+    labs(
+      x = x_label,
+      y = y_label,
+      title = title,
+      subtitle = paste0("Spearman rho across measured genes = ", round(rho, 3))
+    )
+}
+
+p_ko_del_hesc <- plot_effect_comparison(
+  stage_all, "lfc_hESC_KO", "lfc_hESC_DEL",
+  "sig_hESC_KO", "sig_hESC_DEL",
+  "hESC KO log2FC", "hESC DEL log2FC",
+  "Immediate convergence: hESC KO versus hESC DEL"
+)
+print(p_ko_del_hesc)
+ggsave(file.path(output_base, "figures", "scatter_hESC_KO_vs_hESC_DEL.png"), p_ko_del_hesc, width = 8, height = 6)
+
+p_del_stage <- plot_effect_comparison(
+  stage_all, "lfc_hESC_DEL", "mean_5wk_lfc",
+  "sig_hESC_DEL", "reproducible_5wk",
+  "hESC DEL log2FC", "Mean 5-week DEL log2FC",
+  "Developmental continuity: hESC DEL versus 5-week DEL"
+)
+print(p_del_stage)
+ggsave(file.path(output_base, "figures", "scatter_hESC_DEL_vs_5wk_DEL.png"), p_del_stage, width = 8, height = 6)
+
+p_ko_stage <- plot_effect_comparison(
+  stage_all, "lfc_hESC_KO", "mean_5wk_lfc",
+  "sig_hESC_KO", "reproducible_5wk",
+  "hESC KO log2FC", "Mean 5-week DEL log2FC",
+  "Delayed convergence: hESC KO versus 5-week DEL"
+)
+print(p_ko_stage)
+ggsave(file.path(output_base, "figures", "scatter_hESC_KO_vs_5wk_DEL.png"), p_ko_stage, width = 8, height = 6)
+
+#' The overlap counts establish how many thresholded DE genes are shared, while
+#' the direction counts distinguish concordant from opposing responses. The
+#' Spearman correlations address a broader question: whether effect sizes trend in
+#' the same direction across the full measurable transcriptome, even when many
+#' individual genes do not cross the significance threshold in both experiments.
+
+#' ## Pathway Overlap Across Stages
+
+#' Pathway overlap is evaluated from the already-computed GO over-representation
+#' and GSEA result tables. No new enrichment test is run here. For the 5-week
+#' response, a pathway must be significant in both SL25 and SL45 to be considered
+#' reproducible.
+
+# ---- integrated-pathway-overlap --------------------------------------------
+#| echo: false
+
+extract_enrichment_ids <- function(x, padj_cut = 0.05) {
+  if (is.null(x)) return(character())
+  x_df <- tryCatch(as.data.frame(x), error = function(e) data.frame())
+  if (nrow(x_df) == 0 || !"ID" %in% names(x_df)) return(character())
+
+  padj_col <- intersect(c("p.adjust", "padj", "p_adj", "FDR"), names(x_df))[1]
+  if (is.na(padj_col)) return(unique(as.character(x_df$ID)))
+
+  unique(as.character(x_df$ID[!is.na(x_df[[padj_col]]) & x_df[[padj_col]] < padj_cut]))
+}
+
+extract_go_family_ids <- function(go_family, padj_cut = 0.05) {
+  unique(c(
+    extract_enrichment_ids(go_family$up, padj_cut),
+    extract_enrichment_ids(go_family$down, padj_cut)
+  ))
+}
+
+ko_go_ids <- extract_go_family_ids(go_KO)
+del_go_ids <- extract_go_family_ids(go_DEL)
+sl25_go_ids <- extract_enrichment_ids(go_sl25_5wk)
+sl45_go_ids <- extract_enrichment_ids(go_sl45_5wk)
+wk5_go_both <- intersect(sl25_go_ids, sl45_go_ids)
+
+ko_gsea_ids <- extract_enrichment_ids(gsea_KO)
+del_gsea_ids <- extract_enrichment_ids(gsea_DEL)
+sl25_gsea_ids <- extract_enrichment_ids(gsea_sl25_5wk)
+sl45_gsea_ids <- extract_enrichment_ids(gsea_sl45_5wk)
+wk5_gsea_both <- intersect(sl25_gsea_ids, sl45_gsea_ids)
+
+pathway_pair_summary <- function(a, b, label, method) {
+  tibble(
+    method = method,
+    comparison = label,
+    set_A = length(a),
+    set_B = length(b),
+    shared = length(intersect(a, b)),
+    A_only = length(setdiff(a, b)),
+    B_only = length(setdiff(b, a)),
+    percent_of_B_shared = ifelse(length(b) > 0,
+      100 * length(intersect(a, b)) / length(b), NA_real_)
+  )
+}
+
+integrated_pathway_summary <- bind_rows(
+  pathway_pair_summary(ko_go_ids, del_go_ids,
+    "hESC KO vs hESC DEL", "GO ORA"),
+  pathway_pair_summary(del_go_ids, wk5_go_both,
+    "hESC DEL vs 5wk DEL", "GO ORA"),
+  pathway_pair_summary(ko_go_ids, wk5_go_both,
+    "hESC KO vs 5wk DEL", "GO ORA"),
+  pathway_pair_summary(ko_gsea_ids, del_gsea_ids,
+    "hESC KO vs hESC DEL", "GSEA"),
+  pathway_pair_summary(del_gsea_ids, wk5_gsea_both,
+    "hESC DEL vs 5wk DEL", "GSEA"),
+  pathway_pair_summary(ko_gsea_ids, wk5_gsea_both,
+    "hESC KO vs 5wk DEL", "GSEA")
+)
+
+knitr::kable(
+  integrated_pathway_summary,
+  digits = 2,
+  caption = "Overlap of already-computed GO and GSEA pathways across stages"
+)
+write.csv(integrated_pathway_summary, file.path(output_base, "tables", "integrated_pathway_summary.csv"), row.names = FALSE)
+
+#' Gene-level and pathway-level convergence need not be identical. A modest number
+#' of shared DE genes can still converge on related biological processes, while a
+#' large gene overlap without pathway coherence may reflect heterogeneous effects.
+#' The two levels are therefore interpreted together.
+
+#' ## Cross-Stage GSEA Bubble Plot
+
+#' The table above gives overlap counts; this plots the actual pathways side by
+#' side across all four groups (hESC KO, hESC DEL, 5wk SL25, 5wk SL45) so it's
+#' visible at a glance which terms persist from hESC into differentiated neurons
+#' versus which are stage- or genotype-specific, rather than reading that off
+#' overlap counts alone.
+
+#' **Method:** GSEA results from all four groups are pooled into one table
+#' (`Description`, `NES`, `p.adjust`, `setSize`, tagged by group). Rather than
+#' ranking pathways by cross-group recurrence (which would bury a pathway that's
+#' extremely significant in only one group), each group contributes its own top
+#' 15 most significant pathways (by `|signed -log10(adjusted p-value)|`); these
+#' per-group top-15 lists are pooled and de-duplicated by pathway name. Every row
+#' for a selected pathway is then plotted across all four group facets --
+#' including facets where that pathway wasn't top 15 or wasn't significant at
+#' all -- so group-specific hits are protected from being crowded out, while
+#' shared pathways still show up (they simply tend to appear in multiple groups'
+#' top-15 lists).
+
+# ---- cross-stage-gsea-bubble -----------------------------------------------
+#| echo: false
+#| fig-width: 13
+#| fig-height: 11
+
+stage_gsea_list <- list(
+  `hESC KO`  = as.data.frame(gsea_KO)      %>% mutate(Group = "hESC KO"),
+  `hESC DEL` = as.data.frame(gsea_DEL)     %>% mutate(Group = "hESC DEL"),
+  `5wk SL25` = as.data.frame(gsea_sl25_5wk) %>% mutate(Group = "5wk SL25"),
+  `5wk SL45` = as.data.frame(gsea_sl45_5wk) %>% mutate(Group = "5wk SL45")
+)
+
+stage_combined <- bind_rows(stage_gsea_list) %>%
+  dplyr::select(Group, ID, Description, NES, pvalue, p.adjust, setSize) %>%
+  filter(!is.na(p.adjust))
+
+if (nrow(stage_combined) > 0) {
+  stage_combined <- stage_combined %>%
+    mutate(signed_log_p = sign(NES) * (-log10(p.adjust)),
+           Group = factor(Group, levels = c("hESC KO", "hESC DEL", "5wk SL25", "5wk SL45")))
+
+  top_stage_pathways <- stage_combined %>%
+    group_by(Group) %>%
+    slice_max(order_by = abs(signed_log_p), n = 15, with_ties = FALSE) %>%
+    ungroup() %>%
+    pull(Description) %>%
+    unique()
+
+  plot_data_stage <- stage_combined %>%
+    filter(Description %in% top_stage_pathways) %>%
+    group_by(Description) %>%
+    mutate(avg_NES = mean(NES)) %>%
+    ungroup() %>%
+    mutate(Description = reorder(Description, avg_NES))
+
+  p_stage_bubble <- ggplot(plot_data_stage, aes(signed_log_p, Description)) +
+    geom_point(aes(size = setSize, color = NES)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_color_gradient2(low = "blue3", mid = "white", high = "red3", midpoint = 0, name = "NES") +
+    scale_size_continuous(range = c(2, 8), name = "Core\nGenes") +
+    facet_wrap(~ Group, ncol = 2, scales = "free_x") +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = 8), strip.background = element_rect(fill = "gray90")) +
+    labs(x = "Signed -log10(adjusted p-value)", y = "Pathway",
+         title = "GSEA Pathway Enrichment Across Stages: hESC KO/DEL vs 5wk SL25/SL45")
+  print(p_stage_bubble)
+  ggsave(file.path(output_base, "figures", "GSEA_bubble_cross_stage.png"), p_stage_bubble, width = 13, height = 11)
+  write.csv(stage_combined, file.path(output_base, "tables", "GSEA_combined_cross_stage.csv"), row.names = FALSE)
+}
+
+#' ## Integrated Comparison Summary
+
+# ---- integrated-summary-table ----------------------------------------------
+#| echo: false
+
+pathway_wide <- integrated_pathway_summary %>%
+  dplyr::select(method, comparison, shared) %>%
+  tidyr::pivot_wider(names_from = method, values_from = shared,
+    names_prefix = "shared_")
+
+integrated_summary <- integrated_gene_summary %>%
+  dplyr::select(
+    comparison,
+    shared_significant,
+    same_direction,
+    opposite_direction,
+    spearman_all_measured
+  ) %>%
+  left_join(pathway_wide, by = "comparison")
+
+knitr::kable(
+  integrated_summary,
+  digits = 3,
+  caption = "Summary of gene and pathway convergence across the three central comparisons"
+)
+write.csv(integrated_summary, file.path(output_base, "tables", "integrated_summary_final.csv"), row.names = FALSE)
+
+#' This table provides the clearest test of the developmental model. Greater
+#' same-direction gene overlap, stronger effect-size correlation, or greater
+#' pathway recovery for hESC KO versus 5-week DEL than for hESC KO versus hESC DEL
+#' would support delayed convergence toward the KO program. Conversely, stronger
+#' continuity between hESC DEL and 5-week DEL would support persistence or
+#' amplification of an existing DEL-specific program.
+
+#' # Master Summary
+
+#' ## DEG Counts per Comparison
+
+#' One table covering every comparison in this report: the four individual hESC
+#' clones, the two pooled hESC families, and the two 5-week differentiated
+#' clones. `Total genes tested` = genes with a non-missing adjusted p-value;
+#' `Significant` = padj < 0.01 only; `Sig + FC` = padj < 0.01 AND
+#' |log2FC| > 1 (the threshold used everywhere else in this report).
+
+# ---- master-deg-summary ----------------------------------------------------
+#| echo: false
+
+count_stats <- function(df, label) {
+  df <- as.data.frame(df)
+  padj_v <- df$padj
+  lfc_v  <- df$log2FoldChange
+  tibble(
+    Comparison           = label,
+    Total_genes_tested   = sum(!is.na(padj_v)),
+    Significant_padj001  = sum(!is.na(padj_v) & padj_v < alpha),
+    Sig_with_FC          = sum(!is.na(padj_v) & padj_v < alpha & abs(lfc_v) > lfc_cutoff),
+    Upregulated          = sum(!is.na(padj_v) & padj_v < alpha & lfc_v >  lfc_cutoff),
+    Downregulated        = sum(!is.na(padj_v) & padj_v < alpha & lfc_v < -lfc_cutoff)
+  )
+}
+
+master_deg_summary <- bind_rows(
+  count_stats(res_KO56,   "KO56 vs WT (hESC clone)"),
+  count_stats(res_KO67,   "KO67 vs WT (hESC clone)"),
+  count_stats(res_SL25,   "SL25 vs WT (hESC DEL clone)"),
+  count_stats(res_SL45,   "SL45 vs WT (hESC DEL clone)"),
+  count_stats(res_KO_df,  "KO family (pooled) vs WT"),
+  count_stats(res_DEL_df, "DEL family (pooled) vs WT"),
+  count_stats(sl25_5wk,   "SL25 vs H9 (5wk differentiated)"),
+  count_stats(sl45_5wk,   "SL45 vs H9 (5wk differentiated)")
+)
+
+knitr::kable(
+  master_deg_summary,
+  caption = "DEG counts across every comparison: hESC clones, pooled hESC families, and 5wk clones"
+)
+write.csv(master_deg_summary, file.path(output_base, "tables", "master_deg_summary.csv"), row.names = FALSE)
+
+#' ## Overlap Between Comparisons
+
+#' Genes are matched on base Ensembl ID (version suffix stripped) so hESC and
+#' 5wk gene sets are directly comparable. All sets use the same padj < 0.01,
+#' |log2FC| > 1 threshold as the table above. "5wk DEL (reproducible)" is the
+#' set of genes significant, and concordant in direction, in *both* SL25 and
+#' SL45 at 5 weeks (`stage_all$reproducible_5wk`) -- the same definition used
+#' throughout the Cross-Stage sections above, not just "significant in either."
+
+# ---- master-overlap-summary ------------------------------------------------
+#| echo: false
+
+sig_set_base <- function(df, id_col = "gene_id", has_rownames = FALSE) {
+  df <- as.data.frame(df)
+  if (has_rownames) df <- df %>% rownames_to_column(id_col)
+  base_id <- sub("\\..*$", "", df[[id_col]])
+  unique(base_id[!is.na(df$padj) & df$padj < alpha & abs(df$log2FoldChange) > lfc_cutoff])
+}
+
+deg_sets <- list(
+  `KO56 (hESC)`       = sig_set_base(res_KO56, has_rownames = TRUE),
+  `KO67 (hESC)`       = sig_set_base(res_KO67, has_rownames = TRUE),
+  `SL25 (hESC)`       = sig_set_base(res_SL25, has_rownames = TRUE),
+  `SL45 (hESC)`       = sig_set_base(res_SL45, has_rownames = TRUE),
+  `KO family (hESC)`  = sig_set_base(res_KO_df),
+  `DEL family (hESC)` = sig_set_base(res_DEL_df),
+  `SL25 (5wk)`        = sig_set_base(sl25_5wk),
+  `SL45 (5wk)`        = sig_set_base(sl45_5wk),
+  `5wk DEL (reproducible)` = unique(stage_all$ensembl_base[stage_all$reproducible_5wk])
+)
+
+pair_overlap <- function(pairs) {
+  purrr::map_dfr(pairs, function(p) {
+    a <- deg_sets[[p[1]]]; b <- deg_sets[[p[2]]]
+    shared <- length(intersect(a, b))
+    tibble(
+      Set_A = p[1], Set_B = p[2],
+      n_A = length(a), n_B = length(b), Shared = shared,
+      pct_of_A_shared = ifelse(length(a) > 0, round(100 * shared / length(a), 1), NA),
+      pct_of_B_shared = ifelse(length(b) > 0, round(100 * shared / length(b), 1), NA)
+    )
+  })
+}
+
+master_overlap_summary <- pair_overlap(list(
+  c("KO56 (hESC)", "KO67 (hESC)"),
+  c("SL25 (hESC)", "SL45 (hESC)"),
+  c("SL25 (5wk)",  "SL45 (5wk)"),
+  c("KO family (hESC)",  "DEL family (hESC)"),
+  c("DEL family (hESC)", "5wk DEL (reproducible)"),
+  c("KO family (hESC)",  "5wk DEL (reproducible)")
+))
+
+knitr::kable(
+  master_overlap_summary,
+  caption = "Pairwise DEG overlap between clones, pooled families, and 5wk differentiated clones"
+)
+write.csv(master_overlap_summary, file.path(output_base, "tables", "master_overlap_summary.csv"), row.names = FALSE)
+
+cat("KO clone reproducibility (KO56 vs KO67):",
+    master_overlap_summary$pct_of_A_shared[master_overlap_summary$Set_A == "KO56 (hESC)"], "% \n")
+cat("DEL clone reproducibility, hESC (SL25 vs SL45):",
+    master_overlap_summary$pct_of_A_shared[master_overlap_summary$Set_A == "SL25 (hESC)"], "% \n")
+cat("DEL clone reproducibility, 5wk (SL25 vs SL45):",
+    master_overlap_summary$pct_of_A_shared[master_overlap_summary$Set_A == "SL25 (5wk)"], "% \n")
+
+#' **What stands out:**
+
+#' - **KO clones are far more reproducible with each other than DEL clones are.**
+#'   KO56 and KO67 (both null alleles) overlap much more heavily than SL25 and
+#'   SL45 do at the hESC stage -- consistent with complete SMARCE1 loss producing
+#'   a larger, more deterministic transcriptional effect than 3'UTR deletion
+#'   alone, and matching the "On replication" caveat already noted in the
+#'   Discussion (two clones per genotype is a pooled estimate, not eight
+#'   independent replicates).
+#' - **DEL clone concordance changes with differentiation stage.** Comparing the
+#'   SL25-vs-SL45 overlap percentage at hESC stage to the same pair at 5 weeks
+#'   shows whether the DEL phenotype becomes more or less reproducible as cells
+#'   differentiate -- a rise suggests the deletion effect sharpens with
+#'   differentiation; a fall suggests clone-specific noise grows.
+#' - **hESC KO vs hESC DEL overlap** (`KO family` vs `DEL family` row) is the
+#'   most direct test of whether losing SMARCE1 entirely produces a superset of
+#'   what losing just the long 3'UTR does, at the same developmental stage.
+#' - **The two "vs 5wk DEL (reproducible)" rows are the developmental-model
+#'   test**: if hESC KO overlaps the reproducible 5-week DEL signature more than
+#'   hESC DEL does, that supports delayed convergence toward the KO program
+#'   (the same logic as the Integrated Comparison Summary table above, just
+#'   restated here at the raw gene-count level for a single at-a-glance table).
+
+#' # Hallmark SMARCE1-Responsive Genes
+
+#' Hallmark genes are selected objectively from the cross-stage trajectory table,
+#' not from a manually curated list. Up to four genes are taken from each major
+#' trajectory, ranked by a category-specific effect score. This gives a compact set
+#' of genes that represents persistent, delayed, differentiation-specific, and
+#' KO-restricted responses without relying on post hoc biological preference.
+
+# ---- hallmark-gene-selection -----------------------------------------------
+#| echo: false
+#| fig-width: 9
+#| fig-height: 11
+
+hallmark_categories <- c(
+  "Shared persistent",
+  "Persistent DEL",
+  "Delayed KO-like",
+  "Differentiation-specific DEL",
+  "hESC KO-only"
+)
+
+hallmark_genes <- stage_all %>%
+  filter(trajectory %in% hallmark_categories) %>%
+  mutate(
+    gene = if_else(
+      !is.na(gene_symbol) & gene_symbol != "",
+      gene_symbol,
+      ensembl_base
+    ),
+    hallmark_score = case_when(
+      trajectory == "hESC KO-only" ~ abs(lfc_hESC_KO),
+      trajectory == "Persistent DEL" ~
+        (abs(lfc_hESC_DEL) + abs(mean_5wk_lfc)) / 2,
+      trajectory == "Delayed KO-like" ~
+        (abs(lfc_hESC_KO) + abs(mean_5wk_lfc)) / 2,
+      trajectory == "Shared persistent" ~
+        (abs(lfc_hESC_KO) + abs(lfc_hESC_DEL) + abs(mean_5wk_lfc)) / 3,
+      TRUE ~ abs(mean_5wk_lfc)
+    )
+  ) %>%
+  group_by(trajectory) %>%
+  arrange(desc(hallmark_score), .by_group = TRUE) %>%
+  slice_head(n = 4) %>%
+  ungroup()
+
+hallmark_table <- hallmark_genes %>%
+  dplyr::select(
+    trajectory,
+    gene,
+    lfc_hESC_KO,
+    lfc_hESC_DEL,
+    lfc_5wk_SL25,
+    lfc_5wk_SL45,
+    hallmark_score
+  )
+
+knitr::kable(
+  hallmark_table,
+  digits = 3,
+  caption = "Objectively selected hallmark genes representing major SMARCE1 response trajectories"
+)
+write.csv(hallmark_table, file.path(output_base, "tables", "hallmark_genes.csv"), row.names = FALSE)
+
+if (nrow(hallmark_genes) == 0) {
+  cat("No genes met the hallmark trajectory criteria.\n")
+} else {
+  hallmark_mat <- hallmark_genes %>%
+    dplyr::select(lfc_hESC_KO, lfc_hESC_DEL, lfc_5wk_SL25, lfc_5wk_SL45) %>%
+    as.matrix()
+
+  finite_hallmark <- apply(hallmark_mat, 1, function(x) all(is.finite(x)))
+  hallmark_mat <- hallmark_mat[finite_hallmark, , drop = FALSE]
+  hallmark_plot <- hallmark_genes[finite_hallmark, , drop = FALSE]
+
+  if (nrow(hallmark_mat) > 0) {
+    hallmark_mat <- pmax(pmin(hallmark_mat, 4), -4)
+    rownames(hallmark_mat) <- make.unique(hallmark_plot$gene)
+    colnames(hallmark_mat) <- c("hESC KO", "hESC DEL", "5wk SL25", "5wk SL45")
+
+    hallmark_anno <- data.frame(
+      Trajectory = hallmark_plot$trajectory,
+      row.names = rownames(hallmark_mat)
+    )
+
+    pheatmap(
+      hallmark_mat,
+      annotation_row = hallmark_anno,
+      cluster_cols = FALSE,
+      cluster_rows = nrow(hallmark_mat) >= 2,
+      show_rownames = TRUE,
+      fontsize_row = 8,
+      color = colorRampPalette(c("blue3", "white", "red3"))(100),
+      breaks = seq(-4, 4, length.out = 101),
+      main = "Hallmark SMARCE1-responsive genes"
+    )
+
+    pheatmap(
+      hallmark_mat,
+      annotation_row = hallmark_anno,
+      cluster_cols = FALSE,
+      cluster_rows = nrow(hallmark_mat) >= 2,
+      show_rownames = TRUE,
+      fontsize_row = 8,
+      color = colorRampPalette(c("blue3", "white", "red3"))(100),
+      breaks = seq(-4, 4, length.out = 101),
+      main = "Hallmark SMARCE1-responsive genes",
+      filename = file.path(output_base, "figures", "hallmark_genes_heatmap.png"),
+      width = 9, height = 11
+    )
+  }
+}
+
+#' These hallmark genes are intended as a reproducible summary panel. Their known
+#' functions and literature relevance should be interpreted separately and can be
+#' added during manuscript writing after reviewing the objectively selected list.
+
+#' # Discussion
+
+#' This analysis compared complete SMARCE1 loss (KO) against isolated 3'UTR deletion (DEL) in hESCs, each with two independent clones vs shared WT. Key considerations: KO clones showed substantially higher concordance than DEL clones, consistent with SMARCE1 loss producing a larger and more reproducible transcriptional effect than 3'UTR deletion alone. Gene and pathway overlap between KO and DEL indicates the degree to which these two perturbations converge on shared downstream biology versus acting through distinct mechanisms.
+
+#' **On replication:** each genotype was independently engineered only twice (two clones), so the pooled family-level model should be read as a pooled expression estimate, not as eight independent replicates of the genotype effect. The strongest biological claims in this report come from genes reproducible in the same direction across both independent clones (see Clone Concordance and Core Genes sections), not from pooled-model significance alone.
+
+#' # References
+
+#' 1. DESeq2: Love MI, Huber W, Anders S (2014). Genome Biology.
+#' 2. clusterProfiler: Yu G, Wang LG, Han Y, He QY (2012). OMICS.
+#' 3. tximport: Soneson C, Love MI, Robinson MD (2015). F1000Research.
+
+# ---- session-info ----------------------------------------------------------
+sessionInfo()
