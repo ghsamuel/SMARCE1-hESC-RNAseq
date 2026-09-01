@@ -41,9 +41,10 @@ plot_gene_by_clone <- function(gene_id_target, title_gene) {
 }
 
 top_n_genes <- function(de_df, dir, n = 10) {
-  d <- de_df %>% filter(!is.na(padj))
-  if (dir == "up")   d <- d %>% filter(log2FoldChange > 0) %>% arrange(padj)
-  if (dir == "down") d <- d %>% filter(log2FoldChange < 0) %>% arrange(padj)
+  d <- de_df %>%
+    filter(!is.na(padj), padj < alpha, abs(log2FoldChange) > lfc_cutoff)
+  if (dir == "up")   d <- d %>% filter(log2FoldChange > 0) %>% arrange(padj, desc(log2FoldChange))
+  if (dir == "down") d <- d %>% filter(log2FoldChange < 0) %>% arrange(padj, log2FoldChange)
   d %>% slice_head(n = n)
 }
 
