@@ -66,6 +66,15 @@ res_KO67 <- results(dds, contrast = c("genotype", "null2", "WT"), alpha = alpha)
 res_SL25 <- results(dds, contrast = c("genotype", "del1", "WT"), alpha = alpha)
 res_SL45 <- results(dds, contrast = c("genotype", "del2", "WT"), alpha = alpha)
 
+res_KO56_df <- as.data.frame(res_KO56) %>% rownames_to_column("gene_id") %>%
+  mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+res_KO67_df <- as.data.frame(res_KO67) %>% rownames_to_column("gene_id") %>%
+  mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+res_SL25_df <- as.data.frame(res_SL25) %>% rownames_to_column("gene_id") %>%
+  mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+res_SL45_df <- as.data.frame(res_SL45) %>% rownames_to_column("gene_id") %>%
+  mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+
 res_KO56_LFC <- lfcShrink(dds, coef = "genotype_null1_vs_WT", type = "apeglm")
 res_KO67_LFC <- lfcShrink(dds, coef = "genotype_null2_vs_WT", type = "apeglm")
 res_SL25_LFC <- lfcShrink(dds, coef = "genotype_del1_vs_WT", type = "apeglm")
@@ -88,8 +97,10 @@ dds_family <- DESeq(dds_family)
 res_KO  <- results(dds_family, contrast = c("family", "KO",  "WT"), alpha = alpha)
 res_DEL <- results(dds_family, contrast = c("family", "DEL", "WT"), alpha = alpha)
 
-res_KO_df  <- as.data.frame(res_KO)  %>% rownames_to_column("gene_id") %>% mutate(gene_symbol = sym[gene_id])
-res_DEL_df <- as.data.frame(res_DEL) %>% rownames_to_column("gene_id") %>% mutate(gene_symbol = sym[gene_id])
+res_KO_df  <- as.data.frame(res_KO)  %>% rownames_to_column("gene_id") %>%
+  mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
+res_DEL_df <- as.data.frame(res_DEL) %>% rownames_to_column("gene_id") %>%
+  mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
 
 cat("KO family DE genes (padj<0.01):", sum(res_KO_df$padj < alpha, na.rm = TRUE), "\n")
 cat("DEL family DE genes (padj<0.01):", sum(res_DEL_df$padj < alpha, na.rm = TRUE), "\n")
@@ -109,7 +120,7 @@ dds_kd <- DESeq(dds_kd)
 res_KO_vs_DEL_lfc <- lfcShrink(dds_kd, coef = "family_KO_vs_DEL", type = "apeglm")
 res_KO_vs_DEL_raw <- results(dds_kd, name = "family_KO_vs_DEL")
 res_KO_vs_DEL_df <- as.data.frame(res_KO_vs_DEL_lfc) %>% rownames_to_column("gene_id") %>%
-  mutate(gene_symbol = sym[gene_id])
+  mutate(gene_symbol = coalesce(na_if(unname(sym[gene_id]), ""), gene_id))
 
 cat("KO vs DEL: ", sum(res_KO_vs_DEL_df$padj < alpha, na.rm = TRUE), "genes differ directly (padj<", alpha, ")\n")
 
@@ -121,6 +132,8 @@ analysis_results <- list(
   vsd = vsd, pca_data = pca_data, percentVar = percentVar, sumcounts = sumcounts,
   alpha = alpha, lfc_cutoff = lfc_cutoff, de_summary = de_summary,
   res_KO56 = res_KO56, res_KO67 = res_KO67, res_SL25 = res_SL25, res_SL45 = res_SL45,
+  res_KO56_df = res_KO56_df, res_KO67_df = res_KO67_df,
+  res_SL25_df = res_SL25_df, res_SL45_df = res_SL45_df,
   res_KO56_LFC = res_KO56_LFC, res_KO67_LFC = res_KO67_LFC,
   res_SL25_LFC = res_SL25_LFC, res_SL45_LFC = res_SL45_LFC,
   res_KO = res_KO, res_DEL = res_DEL, res_KO_df = res_KO_df, res_DEL_df = res_DEL_df,

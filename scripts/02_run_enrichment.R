@@ -85,6 +85,18 @@ cat("Original terms:", nrow(simMatrix), "| Reduced to", length(unique(reducedTer
 
 gsea_KO_pt <- pairwise_termsim(gsea_KO)
 
+# Relabel gene-member columns (ORA geneID, GSEA core_enrichment) from the
+# ENSEMBL keys used for testing to gene symbols, for readable output tables.
+to_readable <- function(x) setReadable(x, OrgDb = org.Hs.eg.db, keyType = "ENSEMBL")
+gsea_KO            <- to_readable(gsea_KO)
+gsea_DEL           <- to_readable(gsea_DEL)
+go_KO$up           <- to_readable(go_KO$up)
+go_KO$down         <- to_readable(go_KO$down)
+go_DEL$up          <- to_readable(go_DEL$up)
+go_DEL$down        <- to_readable(go_DEL$down)
+gsea_KO_simplified <- to_readable(gsea_KO_simplified)
+gsea_KO_pt         <- to_readable(gsea_KO_pt)
+
 
 enrichment_results <- list(
   go_KO = go_KO, go_DEL = go_DEL, gsea_KO = gsea_KO, gsea_DEL = gsea_DEL,
